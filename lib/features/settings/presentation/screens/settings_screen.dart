@@ -117,6 +117,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
               const SizedBox(height: 20.0),
               _Section(
+                title: 'Library filters',
+                children: [
+                  _MinimumDurationRow(),
+                  _ExcludedFoldersRow(),
+                  if (libraryCtrl.hasLibraryFilters)
+                    _ActionRow(
+                      icon: CupertinoIcons.arrow_counterclockwise,
+                      title: 'Show everything again',
+                      subtitle:
+                          '${libraryCtrl.excludedSongCount} track'
+                          '${libraryCtrl.excludedSongCount == 1 ? '' : 's'} '
+                          'hidden right now',
+                      onTap: libraryCtrl.clearLibraryFilters,
+                    ),
+                ],
+              ),
+              const SizedBox(height: 20.0),
+              _Section(
                 title: 'This device',
                 children: [
                   _ActionRow(
@@ -535,4 +553,239 @@ class _AboutRow extends StatelessWidget {
       ),
     );
   }
+}
+
+/// The shortest-track rule, stepped through a small set of presets.
+///
+/// Presets rather than a free slider: the useful thresholds are round numbers,
+/// and a slider would emit a new exclusion on every pixel of a drag -- each one
+/// rebuilding the library and rewriting the preference file.
+class _MinimumDurationRow extends StatelessWidget {
+  const _MinimumDurationRow();
+
+  static const List<(String, Duration)> presets = [
+    ('Off', Duration.zero),
+    ('30 seconds', Duration(seconds: 30)),
+    ('1 minute', Duration(minutes: 1)),
+    ('90 seconds', Duration(seconds: 90)),
+    ('2 minutes', Duration(minutes: 2)),
+    ('3 minutes', Duration(minutes: 3)),
+    ('5 minutes', Duration(minutes: 5)),
+  ];
+
+  static String labelFor(Duration value) {
+    for (final (label, duration) in presets) {
+      if (duration == value) return label;
+    }
+    return '${value.inSeconds} seconds';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final libraryCtrl = context.watch<LibraryController>();
+    final current = libraryCtrl.minimumDuration;
+
+    return ListTile(
+      leading: const Icon(CupertinoIcons.timer, color: Colors.white70),
+      title: const Text(
+        'Hide short tracks',
+        style: TextStyle(color: Colors.white),
+      ),
+      subtitle: Text(
+        current > Duration.zero
+            ? 'Tracks shorter than ${labelFor(current).toLowerCase()} '
+                  'are left out everywhere'
+            : 'Every track on the device is included',
+        style: TextStyle(color: Colors.white.withValues(alpha: 0.55)),
+      ),
+      trailing: TextButton(
+        onPressed: () => _pickMinimumDuration(context, libraryCtrl, current),
+        child: Text(
+          current > Duration.zero ? labelFor(current) : 'Off',
+          style: const TextStyle(color: IOS27Colors.neonCyan),
+        ),
+      ),
+    );
+  }
+}
+
+Future<void> _pickMinimumDuration(
+  BuildContext context,
+  LibraryController libraryCtrl,
+  Duration current,
+) {
+  return showDialog<void>(
+    context: context,
+    builder: (dialogContext) => SimpleDialog(
+      backgroundColor: const Color(0xFF1C1C1E),
+      title: const Text(
+        'Hide tracks shorter than',
+        style: TextStyle(color: Colors.white, fontSize: 16.0),
+      ),
+      children: [
+        for (final (label, duration) in _MinimumDurationRow.presets)
+          SimpleDialogOption(
+            onPressed: () {
+              libraryCtrl.setMinimumDuration(duration);
+              Navigator.of(dialogContext).pop();
+            },
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    label,
+                    style: const TextStyle(color: Colors.white),
+                  ),
+                ),
+                if (duration == current)
+                  const Icon(
+                    CupertinoIcons.check_mark,
+                    color: IOS27Colors.neonCyan,
+                    size: 18.0,
+                  ),
+              ],
+            ),
+          ),
+      ],
+    ),
+  );
+}
+
+/// Which folders of the device are part of the library.
+class _ExcludedFoldersRow extends StatelessWidget {
+  const _ExcludedFoldersRow();
+
+  @override
+  Widget build(BuildContext context) {
+    final libraryCtrl = context.watch<LibraryController>();
+    final folderCount = libraryCtrl.folderOptions.length;
+    final excluded = libraryCtrl.excludedFolders.length;
+
+    return ListTile(
+      leading: const Icon(CupertinoIcons.folder, color: Colors.white70),
+      title: const Text(
+        'Excluded folders',
+        style: TextStyle(color: Colors.white),
+      ),
+      subtitle: Text(
+        folderCount == 0
+            ? 'No folders detected in this library'
+            : excluded == 0
+            ? '$folderCount folder${folderCount == 1 ? '' : 's'} on this device'
+            : '$excluded of $folderCount folders hidden',
+        style: TextStyle(color: Colors.white.withValues(alpha: 0.55)),
+      ),
+      enabled: folderCount != 0,
+      trailing: Icon(
+        CupertinoIcons.chevron_right,
+        color: Colors.white.withValues(alpha: folderCount == 0 ? 0.2 : 0.5),
+      ),
+      onTap: folderCount == 0
+          ? null
+          : () => showModalBottomSheet<void>(
+              context: context,
+              isScrollControlled: true,
+              backgroundColor: const Color(0xFF1C1C1E),
+              builder: (_) => const _FolderPickerSheet(),
+            ),
+    );
+  }
+}
+
+class _FolderPickerSheet extends StatelessWidget {
+  const _FolderPickerSheet();
+
+  @override
+  Widget build(BuildContext context) {
+    final libraryCtrl = context.watch<LibraryController>();
+    final counts = libraryCtrl.folderSongCounts;
+    final folders = libraryCtrl.folderOptions;
+
+    return SafeArea(
+      child: DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.6,
+        maxChildSize: 0.9,
+        builder: (context, scrollController) => Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20.0, 20.0, 20.0, 4.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Included folders',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 17.0,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 4.0),
+                  Text(
+                    'Turn a folder off to keep its songs out of the whole app.',
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.6),
+                      fontSize: 13.0,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: ListView.builder(
+                controller: scrollController,
+                itemCount: folders.length,
+                itemBuilder: (context, index) {
+                  final folder = folders[index];
+                  final count = counts[folder] ?? 0;
+                  return SwitchListTile.adaptive(
+                    // On means "part of the library": the switch reads as an
+                    // include toggle, which is easier to scan than an
+                    // exclude one.
+                    value: !libraryCtrl.isFolderExcluded(folder),
+                    onChanged: (included) => libraryCtrl.setFolderExcluded(
+                      folder,
+                      excluded: !included,
+                    ),
+                    secondary: const Icon(
+                      CupertinoIcons.folder,
+                      color: Colors.white70,
+                    ),
+                    title: Text(
+                      folderName(folder),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                    subtitle: Text(
+                      '$count track${count == 1 ? '' : 's'} • $folder',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.5),
+                        fontSize: 12.0,
+                      ),
+                    ),
+                    activeTrackColor: IOS27Colors.electricIndigo,
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The last segment of a folder path, for a readable row title.
+String folderName(String path) {
+  final trimmed = path.endsWith('/')
+      ? path.substring(0, path.length - 1)
+      : path;
+  final separator = trimmed.lastIndexOf('/');
+  final name = separator >= 0 ? trimmed.substring(separator + 1) : trimmed;
+  return name.isEmpty ? path : name;
 }

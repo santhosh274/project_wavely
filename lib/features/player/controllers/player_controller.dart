@@ -16,6 +16,20 @@ import 'package:just_audio/just_audio.dart' show PlayerState, SequenceState;
 /// keep a real play history. See [PlayerController.onTrackStarted].
 typedef TrackStartedCallback = void Function(String songId);
 
+/// The transport actions a listening room has to be able to take over.
+///
+/// Deliberately coarse: the room does not care *what* was asked for, only that
+/// the request came from this device's own controls rather than from the host.
+enum PlayerIntent { togglePlayPause, playTrack, playIndex, next, previous, seek }
+
+/// Decides whether a transport call belongs to the room instead of this device.
+///
+/// Returning true consumes the call. A guest installs one so its own buttons
+/// cannot fight the host: the room is the single writer, and a local tap would be
+/// corrected away a moment later anyway, which reads as the controls being
+/// broken.
+typedef PlayerIntentInterceptor = bool Function(PlayerIntent intent);
+
 /// State Controller for Audio Playback & Artwork Derived Colors
 class PlayerController extends ChangeNotifier {
   final AudioEngine _audioService;
@@ -31,6 +45,17 @@ class PlayerController extends ChangeNotifier {
   /// reached for through a provider because the player has no business knowing
   /// that a library exists.
   TrackStartedCallback? _onTrackStarted;
+
+  /// Consulted before every transport call. See [PlayerIntentInterceptor].
+  PlayerIntentInterceptor? intentInterceptor;
+
+  /// Called with the new position whenever the playhead is moved, so a room can
+  /// tell its guests where the host jumped to.
+  void Function(Duration position)? onSeeked;
+
+  /// True while the room is driving playback. This is what lets the room past
+  /// the very interceptor it installed.
+  bool _applyingRemote = false;
 
   bool _isPlaying = false;
   Duration _position = Duration.zero;
@@ -67,8 +92,31 @@ class PlayerController extends ChangeNotifier {
   /// A few dozen albums cover any queue the user can build in a session.
   static const int _maxPaletteEntries = 48;
 
+  /// Width the cover is decoded to before its colours are quantized.
+  ///
+  /// Kept in step with the backdrop's `cacheWidth` so the two share one decoded
+  /// image: a colour histogram over a 64px thumbnail is identical to one over
+  /// the full cover but costs a thousandth of the work.
+  static const double _paletteSampleSize = 64.0;
+
+  /// Albums whose palette is being extracted right now.
+  ///
+  /// A track change and the explicit play that follows it both ask for the same
+  /// album's colours a frame apart; without this, both would decode and quantize
+  /// the cover.
+  final _paletteInFlight = <int>{};
+
   /// Where the session's playback is written so the next launch can pick it up.
   final PlaybackStateStore _stateStore;
+
+  /// A snapshot read before the player existed, so the stored session is in
+  /// hand the moment it is asked to restore it.
+  ///
+  /// The read is file I/O, and it used to be the first thing a restore did --
+  /// on the path that decides what the very first frame shows. Reading it on the
+  /// startup path, alongside the audio-session setup, takes that wait off the
+  /// restore.
+  PlaybackSnapshot? _preloadedSnapshot;
 
   /// The position the store currently holds, used to keep the write rate down.
   Duration _persistedPosition = Duration.zero;
@@ -77,16 +125,28 @@ class PlayerController extends ChangeNotifier {
   /// other to the same file.
   Future<void> _writeChain = Future<void>.value();
 
-  /// Whether [restorePlayback] has already run for this launch.
+  /// Whether [restorePlayback] has already answered for this launch.
   ///
   /// Restoring is a one-off: a later media scan must not cut into music that is
   /// already playing.
   bool _hasRestoredState = false;
 
+  /// The restore this launch is still running, if any.
+  ///
+  /// The two things that ask for it -- the app opening, and the media scan
+  /// finishing -- can arrive moments apart, and only one of them may build the
+  /// queue; the second waits for the first rather than racing it.
+  Future<void>? _restoreInFlight;
+
   /// Set while a restore is in flight, so its own intermediate state -- a queue
   /// that has just been loaded, a playhead on its way back to the stored
   /// position -- cannot be written over the session being restored.
   bool _isRestoring = false;
+
+  /// Track recent seek targets to prevent stale position stream reports from
+  /// springing the slider back right after a seek.
+  Duration? _lastSeekTarget;
+  DateTime? _lastSeekTime;
 
   // Dynamic colors derived from album art
   Color _ambientPrimary = const Color(0xFF6366F1);
@@ -102,9 +162,11 @@ class PlayerController extends ChangeNotifier {
     AudioEngine? audioService,
     ArtworkService? artworkService,
     PlaybackStateStore? stateStore,
+    PlaybackSnapshot? preloadedSnapshot,
   }) : _audioService = audioService ?? AudioPlayerService(),
        _artworkService = artworkService ?? ArtworkService(),
        _stateStore = stateStore ?? FilePlaybackStateStore() {
+    _preloadedSnapshot = preloadedSnapshot;
     _onTrackStarted = onTrackStarted;
     _initListeners();
   }
@@ -179,6 +241,21 @@ class PlayerController extends ChangeNotifier {
     });
 
     _posSub = _audioService.positionStream.listen((pos) {
+      final seekTarget = _lastSeekTarget;
+      final seekTime = _lastSeekTime;
+      if (seekTarget != null && seekTime != null) {
+        final elapsed = DateTime.now().difference(seekTime);
+        if (elapsed < const Duration(milliseconds: 500)) {
+          final diff = (pos - seekTarget).abs();
+          if (diff > const Duration(seconds: 2)) {
+            // Ignore stale position stream updates right after seek.
+            return;
+          }
+        }
+        _lastSeekTarget = null;
+        _lastSeekTime = null;
+      }
+
       _position = pos;
       // Published to the narrow audience rather than through notifyListeners:
       // see [_positionNotifier].
@@ -222,40 +299,79 @@ class PlayerController extends ChangeNotifier {
     List<WavelySong>? queueContext,
     String? queueTitle,
   }) async {
+    if (_intercepted(PlayerIntent.playTrack)) return;
+
     final list = queueContext ?? [song];
     final index = list.indexWhere((s) => s.id == song.id);
 
-    await _audioService.setQueue(list, initialIndex: index >= 0 ? index : 0);
+    final start = index >= 0 ? index : 0;
+    await _audioService.setQueue(list, initialIndex: start);
     _songId = _audioService.currentSong?.id;
     _queueTitle = queueTitle;
+
+    // Warm the covers for the list that was just queued, from the track being
+    // played onwards. The library scan only warms the first few albums it finds
+    // in scan order, which are rarely the ones actually played -- so without
+    // this, the first visit to any album outside that head has to cross the
+    // media store before its cover, and the palette taken from it, can appear.
+    // Fire and forget: a slow media store must never delay the first frame of
+    // playback. Only on an explicit queue load, never on background
+    // auto-advance, where the queries would be spent with the screen off.
+    _warmQueueArtwork(list, start);
 
     // Make the slider reflect the volume the player is actually using, instead
     // of a default it was never told about.
     await _audioService.setVolume(_volume);
 
-    await _audioService.play();
-    await _extractAmbientColors();
+    // Announced *before* the engine is asked to play, and without waiting on
+    // it. just_audio's `play()` future does not complete until playback
+    // *stops*, so awaiting it here used to hold this whole method -- the
+    // transport glyph, the palette extraction and the state save -- until the
+    // end of the song.
+    _isPlaying = true;
     notifyListeners();
+    unawaited(_audioService.play());
+    unawaited(_extractAmbientColors());
     await _persist();
   }
 
   Future<void> togglePlayPause() async {
-    if (_isPlaying) {
-      _isPlaying = false;
-      await _audioService.pause();
-    } else {
-      _isPlaying = true;
-      await _audioService.play();
-    }
+    if (_intercepted(PlayerIntent.togglePlayPause)) return;
+
+    final next = !_isPlaying;
+    _isPlaying = next;
+
+    // Announced before the engine call, and play() is not awaited. The engine's
+    // `play()` future does not complete until playback stops, so awaiting it
+    // here meant the notify below never ran on a real device: the audio started
+    // but the glyph stayed on "play" until the song ended or was paused. The
+    // state stream could not cover for it either, because the field had already
+    // been moved to the new value and the stream's own change check therefore
+    // found nothing to announce.
     notifyListeners();
+
+    if (next) {
+      unawaited(_audioService.play());
+    } else {
+      // pause() completes as soon as the player has paused, so this one can be
+      // waited on.
+      await _audioService.pause();
+    }
+
     // Whether the app should come back playing is decided here, so it has to be
     // recorded at the moment it changes rather than on some later tick.
     await _persist();
   }
 
-  Future<void> skipNext() => _audioService.skipToNext();
+  Future<void> skipNext() async {
+    if (_intercepted(PlayerIntent.next)) return;
+    await _audioService.skipToNext();
+  }
 
-  Future<void> skipPrevious() => _audioService.skipToPrevious();
+  Future<void> skipPrevious() async {
+    if (_intercepted(PlayerIntent.previous)) return;
+    await _audioService.skipToPrevious();
+  }
 
   /// Play the queue entry at [index].
   ///
@@ -263,24 +379,54 @@ class PlayerController extends ChangeNotifier {
   /// one, so tapping a row in the home queue keeps everything else queued behind
   /// it, shuffle order included, and does not re-read the media store.
   Future<void> playIndex(int index) async {
+    if (_intercepted(PlayerIntent.playIndex)) return;
     if (index < 0 || index >= queue.length) return;
 
     await _audioService.jumpToIndex(index);
     // Jumping to a track is a request to hear it, so this resumes a paused
     // player as well as moving the current track along.
     _isPlaying = true;
-    await _audioService.play();
     notifyListeners();
+    // Not awaited for the same reason as [togglePlayPause]: the engine's
+    // play() only completes when playback stops.
+    unawaited(_audioService.play());
     await _persist();
   }
 
   Future<void> seek(Duration pos) {
+    if (_intercepted(PlayerIntent.seek)) return Future<void>.value();
+
     // Reflect the jump immediately rather than waiting for the stream to catch
     // up, or the slider visibly springs back before it moves on.
     _position = pos;
     _positionNotifier.value = pos;
+    _lastSeekTarget = pos;
+    _lastSeekTime = DateTime.now();
+    // Announced only for a seek this device made. One the room applied is the
+    // room's own news, and reporting it back would be a loop.
+    if (!_applyingRemote) onSeeked?.call(pos);
     return _audioService.seek(pos);
   }
+
+  /// Run [action] as the room, past [intentInterceptor].
+  ///
+  /// The room installs the interceptor to keep a guest's own controls from
+  /// fighting the host, and then has to be able to drive playback itself. Rather
+  /// than keep a second set of methods that would drift from the first, every
+  /// action takes the same path and the interceptor is merely stood down for the
+  /// duration.
+  Future<void> applyRemote(Future<void> Function() action) async {
+    _applyingRemote = true;
+    try {
+      await action();
+    } finally {
+      _applyingRemote = false;
+    }
+  }
+
+  /// Whether a transport call is the room's business rather than this device's.
+  bool _intercepted(PlayerIntent intent) =>
+      !_applyingRemote && (intentInterceptor?.call(intent) ?? false);
 
   Future<void> setVolume(double vol) async {
     _volume = vol.clamp(0.0, 1.0);
@@ -346,38 +492,108 @@ class PlayerController extends ChangeNotifier {
 
   /// Put the session back the way the last launch left it.
   ///
-  /// Called with the songs a fresh library scan found, because the stored
-  /// session only holds ids: a track that has since been deleted, or that is
-  /// simply not visible to the scan (the media permission was refused), is
-  /// dropped and the rest of the queue keeps its order. Ids that survive are
-  /// matched back to the current track by position in the queue, so resuming
-  /// lands on the same song even if tracks before it went missing.
+  /// Called twice in a launch, and either call is enough. The first comes the
+  /// moment the player exists, with no arguments: the stored session carries the
+  /// queue itself, so the last song and the list around it are on screen as soon
+  /// as the app has opened, instead of after the media store has been read. The
+  /// second comes when a scan finishes and hands over the library, and is then
+  /// only a chance to refresh the queue's copies of its tracks from it.
   ///
-  /// Does nothing once a session is already loaded, so this cannot cut into
-  /// music the user has started since the app opened.
-  Future<void> restorePlayback({required List<WavelySong> songs}) async {
-    if (_hasRestoredState) return;
-    _hasRestoredState = true;
-
-    if (_audioService.queue.isNotEmpty) return;
-
-    final snapshot = await _stateStore.read();
-    if (snapshot == null) return;
-
-    final byId = <String, WavelySong>{for (final song in songs) song.id: song};
-    final byOriginalIndex = <int, WavelySong>{};
-    for (var i = 0; i < snapshot.songIds.length; i++) {
-      final song = byId[snapshot.songIds[i]];
-      if (song != null) byOriginalIndex[i] = song;
+  /// A session written by an older build holds ids only, and there is nothing to
+  /// build a queue out of until the library has been read: that call is the one
+  /// that answers for it, matching the ids against the songs the scan found. A
+  /// track that has since been deleted, or that the scan cannot see (the media
+  /// permission was refused), is dropped and the rest of the queue keeps its
+  /// order, so resuming still lands on the stored song even if tracks before it
+  /// went missing.
+  ///
+  /// Does nothing once a session is already loaded, so a later scan cannot cut
+  /// into music the user has started since the app opened.
+  Future<void> restorePlayback({List<WavelySong>? songs}) {
+    // Waits rather than returning, and then asks again: the scan's call is the
+    // one that finds out whether the restore it interrupted left anything for
+    // it to do -- which is exactly the case for a session stored as ids, whose
+    // first call had no library to match them against.
+    final inFlight = _restoreInFlight;
+    if (inFlight != null) {
+      return inFlight.then((_) => restorePlayback(songs: songs));
     }
-    if (byOriginalIndex.isEmpty) return;
 
-    final originalIndexes = byOriginalIndex.keys.toList()..sort();
-    final queue = originalIndexes
-        .map((index) => byOriginalIndex[index]!)
-        .toList();
-    final wanted = originalIndexes.indexOf(snapshot.index);
-    final startIndex = wanted >= 0 ? wanted : 0;
+    if (_hasRestoredState) {
+      if (songs != null) _refreshQueueFromLibrary(songs);
+      return Future<void>.value();
+    }
+
+    // Cleared once it settles, so a restore that declined to claim the launch
+    // -- a session of ids with no library yet -- leaves the way open for the
+    // library's call to do it instead.
+    final restore = _restore(songs);
+    final tracked = restore.whenComplete(() => _restoreInFlight = null);
+    _restoreInFlight = tracked;
+    return tracked;
+  }
+
+  Future<void> _restore(List<WavelySong>? library) async {
+    // The user has already started something between the two calls.
+    if (_audioService.queue.isNotEmpty) {
+      _hasRestoredState = true;
+      return;
+    }
+
+    final snapshot = _preloadedSnapshot ?? await _stateStore.read();
+    if (snapshot == null) {
+      // Nothing has ever been played on this device: there is no session, and
+      // waiting for the scan to say so again would be pointless.
+      _hasRestoredState = true;
+      return;
+    }
+
+    final queue = _resolvedQueue(snapshot, library);
+    // A session of ids with no library to match them against yet. Deliberately
+    // left unclaimed -- and the preloaded copy kept -- so the scan's call comes
+    // back for it rather than reading the store over again.
+    if (queue == null || queue.isEmpty) return;
+
+    _preloadedSnapshot = null;
+    _hasRestoredState = true;
+    await _applySnapshot(snapshot, queue: queue);
+  }
+
+  /// The queue [snapshot] stands for, or null while it cannot be built yet.
+  List<WavelySong>? _resolvedQueue(
+    PlaybackSnapshot snapshot,
+    List<WavelySong>? library,
+  ) {
+    // The stored songs are the queue: they were written by the player itself,
+    // and they are what makes the restore independent of the media scan.
+    if (snapshot.songs.isNotEmpty) return List.of(snapshot.songs);
+
+    if (library == null || library.isEmpty) return null;
+
+    final byId = <String, WavelySong>{for (final song in library) song.id: song};
+    final matched = <WavelySong>[];
+    for (final id in snapshot.songIds) {
+      final song = byId[id];
+      if (song != null) matched.add(song);
+    }
+    return matched.isEmpty ? null : matched;
+  }
+
+  /// Load a stored session and take the player to where it was.
+  Future<void> _applySnapshot(
+    PlaybackSnapshot snapshot, {
+    required List<WavelySong> queue,
+  }) async {
+    // The stored index addresses the stored queue; the queue actually built can
+    // be shorter (a session of ids whose tracks have since gone), so the current
+    // track is located by id rather than assumed to still be at that offset.
+    final wantedId = snapshot.index >= 0 && snapshot.index < snapshot.songIds.length
+        ? snapshot.songIds[snapshot.index]
+        : null;
+    final located = wantedId == null
+        ? -1
+        : queue.indexWhere((song) => song.id == wantedId);
+    final startIndex = located >= 0 ? located : 0;
 
     // Held in locals for the whole restore. The player state listener re-reads
     // these from the engine every time the engine reports anything, and it does
@@ -408,11 +624,36 @@ class PlayerController extends ChangeNotifier {
       await _audioService.setShuffle(storedShuffle);
       await _audioService.setRepeatMode(storedRepeat);
       await _audioService.setVolume(storedVolume);
-      await _audioService.setQueue(queue, initialIndex: startIndex);
+
+      // Started but deliberately *not* awaited. The engine publishes the queue
+      // and the current track synchronously, before it opens the source, so the
+      // stored session can be announced now -- while the first track is still
+      // being opened -- rather than after. That wait is the difference between
+      // the last session being on screen at launch and "Nothing playing" for as
+      // long as a media-store query takes.
+      final loading = _audioService.setQueue(queue, initialIndex: startIndex);
+
+      _songId = queue[startIndex].id;
+      _position = storedPosition;
+      _positionNotifier.value = storedPosition;
+      _isPlaying = snapshot.wasPlaying;
+      _useDefaultColors();
+      notifyListeners();
+
+      await loading;
+
+      // The user may have started something else while the source was opening,
+      // and laying the stored playhead over it would cut into what they chose.
+      // Only a restore that still owns the player goes on to seek and play.
+      if (_audioService.currentSong?.id != queue[startIndex].id) return;
+
       await _audioService.seek(storedPosition);
       if (snapshot.wasPlaying) {
         _isPlaying = true;
-        await _audioService.play();
+        // Not awaited: play() does not complete until playback stops, and the
+        // restore still has to read the opened track back and announce the
+        // session rather than waiting out the first song.
+        unawaited(_audioService.play());
       }
 
       // Read back after the load so it matches what the engine actually opened: a
@@ -421,13 +662,39 @@ class PlayerController extends ChangeNotifier {
       _songId = _audioService.currentSong?.id;
       _position = storedPosition;
       _positionNotifier.value = storedPosition;
+      _isPlaying = snapshot.wasPlaying;
+      notifyListeners();
     } finally {
       _isRestoring = false;
     }
 
-    _useDefaultColors();
-    notifyListeners();
+    // The covers are looked up after the session has been announced: the point
+    // of the whole exercise is that the player draws the restored session now,
+    // not after the artwork resolves.
     unawaited(_extractAmbientColors());
+  }
+
+  /// Point the live queue at the library's own copies of its tracks.
+  ///
+  /// A queue restored from disk holds the tracks as they were when the session
+  /// was saved; the scan that has just finished is the better copy of them.
+  /// Entries the scan did not return -- a track hidden by a library filter, on a
+  /// device whose media permission was refused, or deleted since -- are left
+  /// alone rather than dropped, because emptying part of a queue the user can see
+  /// is a far worse outcome than playing a copy that is a few edits old.
+  void _refreshQueueFromLibrary(List<WavelySong> library) {
+    if (library.isEmpty || _audioService.queue.isEmpty) return;
+
+    final byId = <String, WavelySong>{for (final song in library) song.id: song};
+    var changed = false;
+    for (final queued in _audioService.queue) {
+      final fresh = byId[queued.id];
+      if (fresh == null || fresh == queued) continue;
+      _audioService.updateSong(fresh);
+      changed = true;
+    }
+
+    if (changed) notifyListeners();
   }
 
   /// Write the session out right now, bypassing the position throttle.
@@ -444,6 +711,22 @@ class PlayerController extends ChangeNotifier {
   /// store must never hold the library in its loading state.
   void warmArtworkCache(List<WavelySong> songs) {
     unawaited(_artworkService.prefetchAlbums(songs));
+  }
+
+  /// Warm the covers of the queue, starting at [start].
+  ///
+  /// Reordered rather than handed over as-is, because [ArtworkService] warms
+  /// front to back up to its own limit: passing the queue in its natural order
+  /// would spend the whole budget on albums the user may never reach. Starting
+  /// at the playing track means the covers that are one skip away are the ones
+  /// already decoded.
+  void _warmQueueArtwork(List<WavelySong> queue, int start) {
+    unawaited(
+      _artworkService.prefetchAlbums([
+        for (var i = start; i < queue.length; i++) queue[i],
+        for (var i = 0; i < start; i++) queue[i],
+      ]),
+    );
   }
 
   /// Keep the stored position close to the playhead without writing on every
@@ -465,8 +748,10 @@ class PlayerController extends ChangeNotifier {
       return Future<void>.value();
     }
 
-    final snapshot = PlaybackSnapshot(
-      songIds: [for (final song in _audioService.queue) song.id],
+    final snapshot = PlaybackSnapshot.of(
+      // The songs themselves, so the next launch can put the session back
+      // without waiting for a media scan of the whole device.
+      songs: _audioService.queue,
       index: _audioService.currentIndex < 0 ? 0 : _audioService.currentIndex,
       position: _position,
       wasPlaying: _isPlaying,
@@ -507,15 +792,22 @@ class PlayerController extends ChangeNotifier {
   /// decoded an image for. Tracks with no cover on the device keep the default
   /// palette.
   ///
-  /// The generator is handed a 64×64 target: quantizing a full-res cover and
-  /// quantizing a thumbnail answer "what are this album's colours?" identically,
-  /// and the thumbnail costs a fraction of the work. Results are cached per
-  /// album, so the cost is paid once per album per session.
+  /// The cover is decoded down to 64px before it is quantized, through a
+  /// [ResizeImage] rather than by passing a target [Size]. Palette's `size:`
+  /// only scales a *region*; a bare [MemoryImage] still decodes the cover at
+  /// its full 512px and quantizes all ~262k pixels, on this isolate, and its
+  /// `toByteData()` readback stalls the raster thread. That is the hitch that
+  /// used to land exactly as the artwork and backdrop changed. At 64px the
+  /// quantization is ~4k pixels and the readback a few kilobytes.
+  ///
+  /// The resize key is deliberately the same one the backdrop's
+  /// `Image.memory(..., cacheWidth: 64)` uses, so both read one shared decode
+  /// out of the image cache instead of decoding the same cover twice. Results
+  /// are cached per album, so the cost is paid once per album per session.
   Future<void> _extractAmbientColors() async {
     final song = currentSong;
     if (song == null) return;
 
-    final songId = song.id;
     final albumId = song.albumId;
 
     final cached = albumId == null ? null : _paletteCache[albumId];
@@ -524,27 +816,39 @@ class PlayerController extends ChangeNotifier {
       return;
     }
 
-    final bytes = song.artworkBytes ?? await _artworkService.artworkFor(song);
-    if (bytes == null) {
-      _useDefaultColors();
-      return;
-    }
+    // One extraction per album at a time: the sequence change and the explicit
+    // play both ask for the new track's colours, and quantizing the same cover
+    // twice is pure wasted work. A later request for the same album rides on the
+    // cache the in-flight one fills in.
+    if (albumId != null && !_paletteInFlight.add(albumId)) return;
 
     try {
+      final bytes = song.artworkBytes ?? await _artworkService.artworkFor(song);
+      if (bytes == null) {
+        if (currentSong?.albumId == albumId) _useDefaultColors();
+        return;
+      }
+
       final palette = await PaletteGenerator.fromImageProvider(
-        MemoryImage(bytes),
-        size: const Size(64, 64),
+        ResizeImage(MemoryImage(bytes), width: _paletteSampleSize.round()),
+        size: const Size(_paletteSampleSize, _paletteSampleSize),
       );
-      // The queue may have moved on while the palette was being generated.
-      if (currentSong?.id != songId) return;
 
       if (albumId != null) {
         _paletteCache[albumId] = palette;
         _evictPalettesIfNeeded();
       }
+
+      // Applied only while this album is still the one playing: the queue may
+      // have rolled on, and colours from a track that is gone would tint the
+      // screen wrong. Matching the *album* rather than the track keeps a track
+      // change within one album from discarding colours that still apply.
+      if (currentSong?.albumId != albumId) return;
       _applyPalette(palette);
     } on Object {
-      _useDefaultColors();
+      if (currentSong?.albumId == albumId) _useDefaultColors();
+    } finally {
+      if (albumId != null) _paletteInFlight.remove(albumId);
     }
   }
 

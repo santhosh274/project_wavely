@@ -7,6 +7,7 @@ import 'package:wavely/core/services/audio_player_service.dart'
 import 'package:wavely/core/services/playback_state_store.dart';
 import 'package:wavely/features/player/controllers/player_controller.dart';
 
+import 'support/fake_artwork_service.dart';
 import 'support/fake_audio_engine.dart';
 import 'support/memory_playback_store.dart';
 
@@ -30,18 +31,56 @@ const _neon = WavelySong(
   genre: 'Ambient',
 );
 
+/// The same three tracks, but with album ids, so the artwork warming has
+/// something to key on.
+const _auroraAlbum = WavelySong(
+  id: '20',
+  title: 'Aurora Fields',
+  artist: 'Real Artist',
+  album: 'First Album',
+  albumId: 1,
+  duration: Duration(minutes: 3, seconds: 20),
+  uri: 'content://media/external/audio/media/20',
+);
+
+const _neonAlbum = WavelySong(
+  id: '21',
+  title: 'Neon Tide',
+  artist: 'Another Artist',
+  album: 'Second Album',
+  albumId: 2,
+  duration: Duration(minutes: 4, seconds: 5),
+  uri: 'content://media/external/audio/media/21',
+);
+
+const _thicketAlbum = WavelySong(
+  id: '22',
+  title: 'Thicket',
+  artist: 'Third Artist',
+  album: 'Third Album',
+  albumId: 3,
+  duration: Duration(minutes: 2, seconds: 40),
+  uri: 'content://media/external/audio/media/22',
+);
+
 void main() {
   late FakeAudioEngine engine;
   late List<String> started;
   late MemoryPlaybackStateStore store;
+  late FakeArtworkService artwork;
   late PlayerController controller;
 
   setUp(() {
     engine = FakeAudioEngine();
     started = [];
     store = MemoryPlaybackStateStore();
+    // A device with no covers by default: these tests are about the player's
+    // own state, not about image decoding. The fake also records which albums
+    // were asked about, which is how the warming test below observes its order.
+    artwork = FakeArtworkService();
     controller = PlayerController(
       audioService: engine,
+      artworkService: artwork,
       onTrackStarted: started.add,
       stateStore: store,
     );
@@ -204,6 +243,55 @@ void main() {
     expect(controller.isPlaying, isTrue);
   });
 
+  group('the transport never waits on the engine', () {
+    // just_audio's play() future stays open for as long as the music plays, so
+    // anything that awaits it only runs once the song is over. The fake can be
+    // asked to behave the same way; with the awaiting bug these tests hang and
+    // fail on the test timeout rather than on an assertion -- which is exactly
+    // what the glyph did on a device: the audio started, the icon stayed on
+    // play until the track ended.
+
+    test('resuming announces playing without waiting out the song', () async {
+      engine.playCompletesOnStop = true;
+      await controller.playTrack(_aurora, queueContext: const [_aurora]);
+      await controller.togglePlayPause();
+      expect(controller.isPlaying, isFalse);
+
+      var notified = 0;
+      controller.addListener(() => notified++);
+      await controller.togglePlayPause();
+
+      expect(controller.isPlaying, isTrue);
+      // The announcement has to happen while the song is playing, not after it:
+      // the engine's play() future is deliberately still open here, exactly as
+      // it is for the whole of a real song.
+      expect(engine.isPlayPending, isTrue);
+      expect(notified, greaterThan(0));
+    });
+
+    test('starting a track announces it without waiting out the song', () async {
+      engine.playCompletesOnStop = true;
+
+      await controller.playTrack(_aurora, queueContext: const [_aurora, _neon]);
+
+      expect(controller.isPlaying, isTrue);
+      expect(controller.currentSong?.id, '10');
+    });
+
+    test('choosing a queue row announces it without waiting out the song',
+        () async {
+      engine.playCompletesOnStop = true;
+      await controller.playTrack(_aurora, queueContext: const [_aurora, _neon]);
+      await controller.togglePlayPause();
+      expect(controller.isPlaying, isFalse);
+
+      await controller.playIndex(1);
+
+      expect(controller.isPlaying, isTrue);
+      expect(controller.currentSong?.id, '11');
+    });
+  });
+
   test('an index outside the queue is ignored rather than crashing', () async {
     await controller.playTrack(_aurora, queueContext: const [_aurora, _neon]);
 
@@ -222,6 +310,37 @@ void main() {
     await Future<void>.delayed(Duration.zero);
 
     expect(started, ['10', '11']);
+  });
+
+  group('warming the covers of a new queue', () {
+    // The queue is warmed front to back up to a fixed limit, so the order it is
+    // handed over in decides which covers are ready when the user skips ahead.
+    test('starts at the track being played, not the head of the list', () async {
+      await controller.playTrack(_neonAlbum, queueContext: const [
+        _auroraAlbum,
+        _neonAlbum,
+        _thicketAlbum,
+      ]);
+
+      // The head album is all the natural order would have warmed first; the one
+      // that matters is the album of the track that is actually playing.
+      expect(artwork.requestedAlbumIds.first, _neonAlbum.albumId);
+      expect(artwork.requestedAlbumIds, contains(_auroraAlbum.albumId));
+      expect(artwork.requestedAlbumIds, contains(_thicketAlbum.albumId));
+    });
+
+    test('a single track with no queue still warms its own cover', () async {
+      await controller.playTrack(_auroraAlbum);
+
+      expect(artwork.requestedAlbumIds, contains(_auroraAlbum.albumId));
+    });
+
+    test('albums without a cover are simply skipped', () async {
+      // _aurora and _neon carry no album id at all.
+      await controller.playTrack(_neon, queueContext: const [_aurora, _neon]);
+
+      expect(artwork.requestedAlbumIds, isEmpty);
+    });
   });
 
   // The whole point of the store: what the app was playing has to still be there
@@ -511,6 +630,180 @@ void main() {
       await controller.restorePlayback(songs: const [_aurora, _neon]);
 
       expect(store.snapshot, stored);
+    });
+  });
+
+  // A session saved by this build carries the songs themselves, so opening the
+  // app no longer has to wait for a media scan of the whole device before it can
+  // show what was playing.
+  group('restoring without waiting for the library', () {
+    PlaybackSnapshot storedQueue({
+      List<WavelySong> songs = const [_aurora, _neon],
+      int index = 1,
+      Duration position = const Duration(seconds: 30),
+      String? queueTitle = 'Road Trip',
+    }) => PlaybackSnapshot.of(
+      songs: songs,
+      index: index,
+      position: position,
+      wasPlaying: true,
+      shuffle: false,
+      repeatMode: RepeatBehaviour.off,
+      volume: 0.8,
+      queueTitle: queueTitle,
+      savedAt: DateTime(2026, 1, 1),
+    );
+
+    test('the session is loaded with no library in sight', () async {
+      store.snapshot = storedQueue();
+
+      // The call the app makes the moment the player exists: no songs, because
+      // the media store has not answered yet.
+      await controller.restorePlayback();
+
+      expect(controller.queue, const [_aurora, _neon]);
+      expect(controller.currentSong?.id, '11');
+      expect(controller.position, const Duration(seconds: 30));
+      expect(controller.isPlaying, isTrue);
+      expect(controller.queueTitle, 'Road Trip');
+    });
+
+    test('the session is announced before the source finishes opening',
+        () async {
+      store.snapshot = storedQueue();
+      engine.holdSetQueue = true;
+
+      // What the UI was told the moment the restore first reported a song.
+      String? announcedSongId;
+      var pendingWhenAnnounced = false;
+      controller.addListener(() {
+        if (announcedSongId != null || controller.currentSong == null) return;
+        announcedSongId = controller.currentSong!.id;
+        pendingWhenAnnounced = engine.isSetQueuePending;
+      });
+
+      final restore = controller.restorePlayback();
+      await pumpEventQueue();
+
+      // The last session is on screen -- queue and all -- while the first track
+      // is still being opened, instead of after the file open and the decoder.
+      expect(announcedSongId, '11');
+      expect(controller.currentSong?.id, '11');
+      expect(controller.queue, const [_aurora, _neon]);
+      expect(controller.position, const Duration(seconds: 30));
+      expect(pendingWhenAnnounced, isTrue);
+      expect(engine.isSetQueuePending, isTrue);
+
+      // And the restore still finishes once the source is open.
+      engine.releaseSetQueue();
+      await restore;
+      expect(controller.currentSong?.id, '11');
+      expect(controller.position, const Duration(seconds: 30));
+    });
+
+    test('a snapshot read at startup is used without reading the store again',
+        () async {
+      // What the startup path hands over: the file was already read while the
+      // audio session was being set up, so the restore has it in hand.
+      final preloaded = PlaybackSnapshot.of(
+        songs: const [_aurora, _neon],
+        index: 1,
+        position: const Duration(seconds: 12),
+        wasPlaying: true,
+        shuffle: false,
+        repeatMode: RepeatBehaviour.off,
+        volume: 0.8,
+        queueTitle: 'Road Trip',
+        savedAt: DateTime(2026, 1, 1),
+      );
+      // A different, stale session on disk: the preloaded one has to win.
+      store.snapshot = _snapshotOf(
+        songIds: const ['10'],
+        position: const Duration(seconds: 90),
+        queueTitle: 'Stale',
+      );
+
+      final earlyEngine = FakeAudioEngine();
+      final early = PlayerController(
+        audioService: earlyEngine,
+        artworkService: FakeArtworkService(),
+        stateStore: store,
+        preloadedSnapshot: preloaded,
+      );
+      addTearDown(early.dispose);
+
+      await early.restorePlayback();
+
+      expect(store.reads, 0);
+      expect(early.queue, const [_aurora, _neon]);
+      expect(early.currentSong?.id, '11');
+      expect(early.position, const Duration(seconds: 12));
+      expect(early.queueTitle, 'Road Trip');
+    });
+
+    test('the scan that lands afterwards adopts the library copies', () async {
+      store.snapshot = storedQueue(songs: const [_aurora]);
+      await controller.restorePlayback();
+
+      // The library is the better copy of the same track -- favourite flags
+      // included -- so the queue is refreshed from it rather than rebuilt.
+      final favourited = _aurora.copyWith(isFavorite: true);
+      await controller.restorePlayback(songs: [favourited, _neon]);
+
+      expect(engine.setQueueCalls, hasLength(1));
+      expect(controller.queue, hasLength(1));
+      expect(controller.currentSong?.isFavorite, isTrue);
+    });
+
+    test('a scan cannot restart a session the user has moved on from',
+        () async {
+      store.snapshot = storedQueue();
+      await controller.restorePlayback();
+
+      await controller.playTrack(
+        _thicketAlbum,
+        queueContext: const [_thicketAlbum],
+      );
+      await controller.restorePlayback(songs: const [_aurora, _neon]);
+
+      expect(controller.currentSong?.id, _thicketAlbum.id);
+      expect(engine.setQueueCalls.last, const [_thicketAlbum]);
+    });
+
+    test('a queue of ids is left for the scan that can resolve it', () async {
+      // A session written by an older build: ids only, so nothing can be built
+      // until the library arrives. It must not be written off as "nothing to
+      // restore" by the startup call.
+      store.snapshot = _snapshotOf(songIds: const ['10', '11'], index: 1);
+
+      await controller.restorePlayback();
+      expect(controller.queue, isEmpty);
+
+      await controller.restorePlayback(songs: const [_aurora, _neon]);
+      expect(controller.currentSong?.id, '11');
+    });
+
+    test('an empty store is settled immediately', () async {
+      await controller.restorePlayback();
+      await controller.restorePlayback(songs: const [_aurora, _neon]);
+
+      // Nothing has ever been played, and a later scan does not conjure a
+      // session out of the library.
+      expect(controller.queue, isEmpty);
+      expect(engine.setQueueCalls, isEmpty);
+    });
+
+    test('the two calls racing each other still build one queue', () async {
+      store.snapshot = storedQueue();
+
+      // The scan landing while the stored session is still being read.
+      await Future.wait([
+        controller.restorePlayback(),
+        controller.restorePlayback(songs: const [_aurora, _neon]),
+      ]);
+
+      expect(engine.setQueueCalls, hasLength(1));
+      expect(controller.queue, hasLength(2));
     });
   });
 }

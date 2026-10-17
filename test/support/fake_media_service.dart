@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:wavely/core/models/song_model.dart';
 import 'package:wavely/core/services/local_media_service.dart';
 
@@ -14,11 +16,22 @@ class FakeLocalMediaService extends LocalMediaService {
   /// When true the scan reports a declined permission instead of the tracks.
   bool permissionGranted = true;
 
+  /// Held open to keep a scan from answering at all.
+  ///
+  /// A real device reads the media store for a noticeable while, and what the
+  /// app shows *during* that read is the whole question of the tests that use
+  /// this: with it unset a scan answers immediately, which hides the very window
+  /// they exist to look at.
+  Completer<void>? scanGate;
+
   @override
   Future<bool> requestPermissions() async => permissionGranted;
 
   @override
   Future<LibraryLoadResult> fetchLocalSongs() async {
+    final gate = scanGate;
+    if (gate != null) await gate.future;
+
     if (!permissionGranted) {
       return const LibraryLoadResult(
         status: LibraryLoadStatus.permissionDenied,

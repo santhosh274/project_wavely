@@ -25,6 +25,14 @@ class WavelySong {
   final int? trackNumber;
   final bool isFavorite;
 
+  /// Size of the file in bytes, when the media store reported one.
+  ///
+  /// Carried so two devices can tell whether they are holding the *same file*
+  /// rather than two rips of the same song: title and artist collide constantly
+  /// across compilations and remasters, but byte count does not. A listening
+  /// room matches guest libraries on this before it falls back to metadata.
+  final int? fileSize;
+
   const WavelySong({
     required this.id,
     required this.title,
@@ -39,6 +47,7 @@ class WavelySong {
     this.genre,
     this.trackNumber,
     this.isFavorite = false,
+    this.fileSize,
   });
 
   String get durationFormatted {
@@ -61,6 +70,7 @@ class WavelySong {
     String? genre,
     int? trackNumber,
     bool? isFavorite,
+    int? fileSize,
   }) {
     return WavelySong(
       id: id ?? this.id,
@@ -76,6 +86,7 @@ class WavelySong {
       genre: genre ?? this.genre,
       trackNumber: trackNumber ?? this.trackNumber,
       isFavorite: isFavorite ?? this.isFavorite,
+      fileSize: fileSize ?? this.fileSize,
     );
   }
 }

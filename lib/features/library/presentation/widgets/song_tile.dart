@@ -5,11 +5,11 @@ import 'package:wavely/core/widgets/glass_card.dart';
 import 'package:wavely/core/widgets/artwork_image.dart';
 import 'package:wavely/core/theme/ios27_colors.dart';
 
-/// The light white the playing row glows and reads in, on every menu.
+/// The near-white the selected row's title reads in, on every menu.
 ///
 /// Deliberately not the artwork's palette colour: a dark or muddy cover made
 /// the "what is playing" highlight hard to spot. A near-white reads as lit up
-/// against every cover, and the mini player tints to match it.
+/// against every cover, and the mini player's progress line matches it.
 const Color kCurrentTrackColor = Color(0xFFF2F4F8);
 
 /// Glassmorphic Song Tile Item
@@ -20,8 +20,14 @@ class SongTile extends StatelessWidget {
   final VoidCallback onTap;
   final VoidCallback? onFavoriteToggle;
 
-  /// Exposed so the mini player can tint to the same light white and the
-  /// selection reads as one system across menus.
+  /// Opens the row's action sheet on a long press.
+  ///
+  /// The list owns what the menu can do -- it knows the queue the row belongs
+  /// to, which [SongTile] does not -- so the callback is supplied by the caller
+  /// rather than the tile reaching for providers itself.
+  final VoidCallback? onLongPress;
+
+  /// Exposed so other surfaces can match the selection's highlight colour.
   static const Color currentTrackColor = kCurrentTrackColor;
 
   const SongTile({
@@ -31,23 +37,30 @@ class SongTile extends StatelessWidget {
     this.isPlaying = false,
     required this.onTap,
     this.onFavoriteToggle,
+    this.onLongPress,
   });
 
   @override
   Widget build(BuildContext context) {
+    final selected = isCurrent;
+    final playing = selected && isPlaying;
+
     return RepaintBoundary(
       // Rows repaint in isolation: an animated neighbour (mini-player tint,
-      // selection glow) no longer repaints every row on screen.
+      // selection state) no longer repaints every row on screen.
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 4.0, horizontal: 16.0),
         child: GlassCard(
           onTap: onTap,
-          padding: const EdgeInsets.all(10.0),
-          isSelected: isCurrent,
-          // The playing row reads as "lit up" rather than coloured: a light
-          // white glow and border on every menu, so the selection never
-          // depends on the artwork's palette (which can be dark or muddy).
-          glowColor: kCurrentTrackColor,
+          onLongPress: onLongPress,
+          padding: const EdgeInsets.symmetric(horizontal: 10.0, vertical: 6.0),
+          isSelected: selected,
+          // The selected row is a fully opaque, elevated slate slab -- no
+          // glass, no sheen, no translucent gradient. The "fog" a selected
+          // row used to show was the glass layers brightening its middle;
+          // opaque mode renders none of them, so the whole row reads as one
+          // solid surface, Apple/Google player style.
+          opaque: selected,
           child: Row(
             children: [
               // Album Artwork Container
@@ -55,13 +68,11 @@ class SongTile extends StatelessWidget {
                 song: song,
                 size: 48.0,
                 borderRadius: BorderRadius.circular(12.0),
-                // The playing row shows a waveform instead of the cover, so
-                // the "this is what is playing" signal survives tracks that
-                // have art.
+                // With no cover to show, the playing row displays a waveform
+                // instead of the plain note, so the "this is what is playing"
+                // signal survives tracks without artwork too.
                 placeholder: Icon(
-                  isCurrent && isPlaying
-                      ? CupertinoIcons.waveform
-                      : CupertinoIcons.music_note,
+                  playing ? CupertinoIcons.waveform : CupertinoIcons.music_note,
                   color: Colors.white,
                   size: 22.0,
                 ),
@@ -72,20 +83,19 @@ class SongTile extends StatelessWidget {
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Text(
                       song.title,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        fontWeight:
-                            isCurrent ? FontWeight.w700 : FontWeight.w600,
+                        fontWeight: selected ? FontWeight.w700 : FontWeight.w600,
                         fontSize: 15.0,
-                        // The playing row reads in light white -- a highlight,
-                        // not a colour taken from the artwork's palette.
-                        color: isCurrent
-                            ? kCurrentTrackColor
-                            : Colors.white,
+                        // Selected rows read in near-white on the opaque
+                        // slate; unselected rows stay plain white on glass.
+                        color: selected ? kCurrentTrackColor : Colors.white,
                       ),
                     ),
                     const SizedBox(height: 3.0),

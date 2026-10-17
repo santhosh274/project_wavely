@@ -65,7 +65,11 @@ subprojects {
 //    plugin modules, so these hooks run ahead of AGP's own afterEvaluate and
 //    still take effect. :app is skipped because evaluationDependsOn(":app") above
 //    has already evaluated it (and it is an application module, not a library).
-val flutterCompileSdk = 36
+// 37 rather than Flutter's 36 default: `permission_handler_android` references
+// Manifest.permission.ACCESS_LOCAL_NETWORK (added in API 37), so it cannot
+// compile against 36. The app itself is built against the same SDK; see
+// android/app/build.gradle.kts for why it targets 37 as well.
+val flutterCompileSdk = 37
 
 subprojects {
     if (!state.executed) {

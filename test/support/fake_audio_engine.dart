@@ -62,6 +62,26 @@ class FakeAudioEngine implements AudioEngine {
   /// Every queue the controller loaded, in order.
   final List<List<WavelySong>> setQueueCalls = [];
 
+  /// Whether [setQueue] should stay open after publishing the queue.
+  ///
+  /// The real engine sets the queue and the current track synchronously and only
+  /// then opens the source, so a restore can draw the session before that
+  /// finishes. Holding the future open stands in for a slow open and lets a test
+  /// assert the session was announced while the load was still pending.
+  bool holdSetQueue = false;
+
+  Completer<void>? _setQueueCompleter;
+
+  /// Whether a [setQueue] future is still open, i.e. the source is still being
+  /// opened.
+  bool get isSetQueuePending => _setQueueCompleter != null;
+
+  /// Let a held [setQueue] finish.
+  void releaseSetQueue() {
+    _setQueueCompleter?.complete();
+    _setQueueCompleter = null;
+  }
+
   @override
   Future<void> setQueue(List<WavelySong> songs, {int initialIndex = 0}) async {
     setQueueCalls.add(List.of(songs));
@@ -73,13 +93,38 @@ class FakeAudioEngine implements AudioEngine {
     }
     _currentSong = _queue[initialIndex.clamp(0, _queue.length - 1)];
     _sequenceController.add(null);
+
+    if (holdSetQueue) {
+      final completer = Completer<void>();
+      _setQueueCompleter = completer;
+      await completer.future;
+    }
   }
+
+  /// Whether [play] behaves like the real player, whose future stays open for
+  /// as long as the music plays.
+  ///
+  /// just_audio's `play()` does not complete until playback stops, pauses or
+  /// errors; a fake that returns instantly hides any code that wrongly awaits
+  /// it. Turn this on for tests about what the controller announces while
+  /// playing.
+  bool playCompletesOnStop = false;
+
+  Completer<void>? _playCompleter;
+
+  /// Whether a [play] future is still open, i.e. the engine considers itself
+  /// mid-song. Lets a test prove the controller did not wait for it.
+  bool get isPlayPending => _playCompleter != null;
 
   @override
   Future<void> play() async {
     _playerStateController.add(
       PlayerState(true, ProcessingState.ready),
     );
+    if (!playCompletesOnStop) return;
+    final completer = Completer<void>();
+    _playCompleter = completer;
+    await completer.future;
   }
 
   @override
@@ -87,6 +132,7 @@ class FakeAudioEngine implements AudioEngine {
     _playerStateController.add(
       PlayerState(false, ProcessingState.ready),
     );
+    _finishPlay();
   }
 
   @override
@@ -94,15 +140,37 @@ class FakeAudioEngine implements AudioEngine {
     _playerStateController.add(
       PlayerState(false, ProcessingState.idle),
     );
+    _finishPlay();
   }
+
+  /// Closes the open [play] future, the way the real player does when playback
+  /// ends.
+  void _finishPlay() {
+    _playCompleter?.complete();
+    _playCompleter = null;
+  }
+
+  /// Every seek asked for, in order. The room corrects a guest by seeking or by
+  /// changing the rate, and a test has to be able to tell which of the two it
+  /// chose.
+  final List<Duration> seekCalls = [];
 
   @override
   Future<void> seek(Duration position) async {
+    seekCalls.add(position);
     _positionController.add(position);
   }
 
   @override
   Future<void> setVolume(double volume) async {}
+
+  /// The last rate asked for, so a room test can see the nudge it applied.
+  double speed = 1.0;
+
+  @override
+  Future<void> setSpeed(double speed) async {
+    this.speed = speed;
+  }
 
   @override
   Future<void> setShuffle(bool enabled) async {

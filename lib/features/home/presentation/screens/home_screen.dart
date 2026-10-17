@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:wavely/core/models/song_model.dart';
 import 'package:wavely/features/library/controllers/library_controller.dart';
+import 'package:wavely/features/library/presentation/widgets/song_context_menu.dart';
 import 'package:wavely/features/library/presentation/widgets/song_tile.dart';
 import 'package:wavely/features/player/controllers/player_controller.dart';
 
@@ -23,11 +24,12 @@ class HomeScreen extends StatelessWidget {
     final playerCtrl = context.watch<PlayerController>();
     final songs = playerCtrl.queue;
 
-    // The mini player lives in the shell dock, not here: the header, the queue
-    // and the dock share one background with no floating pills between them.
-    // Clearance matches the dock below -- nav bar alone, or nav plus the mini
-    // player while something is loaded.
-    final dockClearance = playerCtrl.currentSong != null ? 160.0 : 88.0;
+    // The mini player lives in the shell dock, not here, and the queue scrolls
+    // *underneath* it: the clearance is padding at the end of the list rather
+    // than an empty gap in the column, so the rows pass behind the glass dock
+    // and the last track can still be scrolled clear of it. A blank strip below
+    // the list would read as a black band behind the dock instead.
+    final dockClearance = playerCtrl.currentSong != null ? 196.0 : 112.0;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -51,9 +53,8 @@ class HomeScreen extends StatelessWidget {
               Expanded(
                 child: songs.isEmpty
                     ? const _NothingPlaying()
-                    : _QueueList(songs: songs),
+                    : _QueueList(songs: songs, bottomPadding: dockClearance),
               ),
-              SizedBox(height: dockClearance),
             ],
           ),
       ),
@@ -170,7 +171,11 @@ class _HomeHeader extends StatelessWidget {
 class _QueueList extends StatelessWidget {
   final List<WavelySong> songs;
 
-  const _QueueList({required this.songs});
+  /// Room at the end of the list for the floating dock, so the last row can be
+  /// scrolled up out from behind it.
+  final double bottomPadding;
+
+  const _QueueList({required this.songs, required this.bottomPadding});
 
   @override
   Widget build(BuildContext context) {
@@ -180,7 +185,8 @@ class _QueueList extends StatelessWidget {
 
     return ListView.builder(
       itemCount: songs.length,
-      padding: const EdgeInsets.only(top: 6.0, bottom: 24.0),
+      itemExtent: 68.0,
+      padding: EdgeInsets.only(top: 6.0, bottom: bottomPadding + 24.0),
       addAutomaticKeepAlives: false,
       itemBuilder: (context, index) {
         final song = songs[index];
@@ -194,6 +200,12 @@ class _QueueList extends StatelessWidget {
           isCurrent: index == currentIndex,
           isPlaying: playerCtrl.isPlaying,
           onTap: () => playerCtrl.playIndex(index),
+          onLongPress: () => showSongContextMenu(
+            context,
+            song: song,
+            queueContext: songs,
+            queueTitle: playerCtrl.queueTitle,
+          ),
           onFavoriteToggle: () {
             libraryCtrl.toggleFavorite(song.id);
             // The queue holds its own copies, so the library's toggle has to be

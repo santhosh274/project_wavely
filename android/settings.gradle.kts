@@ -1,17 +1,26 @@
-// Fix for AGP AndroidLocationsException when both ANDROID_PREFS_ROOT and ANDROID_USER_HOME are set
+// Fix for AGP AndroidLocationsException when both ANDROID_PREFS_ROOT and ANDROID_USER_HOME are set in environment
 try {
     val processEnvClass = Class.forName("java.lang.ProcessEnvironment")
-    try {
-        val field = processEnvClass.getDeclaredField("theEnvironment")
-        field.isAccessible = true
-        (field.get(null) as? MutableMap<String, String>)?.remove("ANDROID_PREFS_ROOT")
-    } catch (_: Throwable) {}
-    try {
-        val field = processEnvClass.getDeclaredField("theUnmodifiableEnvironment")
-        field.isAccessible = true
-        (field.get(null) as? MutableMap<String, String>)?.remove("ANDROID_PREFS_ROOT")
-    } catch (_: Throwable) {}
-} catch (_: Throwable) {}
+    val unsafeClass = Class.forName("sun.misc.Unsafe")
+    val unsafeField = unsafeClass.getDeclaredField("theUnsafe")
+    unsafeField.isAccessible = true
+    val unsafe = unsafeField.get(null)
+
+    val longType = java.lang.Long.TYPE
+    val staticFieldBaseMethod = unsafeClass.getMethod("staticFieldBase", java.lang.reflect.Field::class.java)
+    val staticFieldOffsetMethod = unsafeClass.getMethod("staticFieldOffset", java.lang.reflect.Field::class.java)
+    val getObjectMethod = unsafeClass.getMethod("getObject", Any::class.java, longType)
+
+    val envField = processEnvClass.getDeclaredField("theEnvironment")
+    val base = staticFieldBaseMethod.invoke(unsafe, envField)
+    val offset = staticFieldOffsetMethod.invoke(unsafe, envField) as Long
+    @Suppress("UNCHECKED_CAST")
+    val envMap = getObjectMethod.invoke(unsafe, base, offset) as? MutableMap<String, String>
+    val removed = envMap?.remove("ANDROID_PREFS_ROOT")
+    println("WAVELY_GRADLE_FIX: Removed ANDROID_PREFS_ROOT: $removed")
+} catch (e: Throwable) {
+    println("WAVELY_GRADLE_FIX_ERROR: ${e.javaClass.name}: ${e.message}")
+}
 
 pluginManagement {
     val flutterSdkPath =

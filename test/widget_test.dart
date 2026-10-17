@@ -9,6 +9,9 @@ import 'package:wavely/features/library/controllers/library_controller.dart';
 import 'package:wavely/core/services/local_media_service.dart';
 import 'package:wavely/core/models/song_model.dart';
 import 'package:wavely/features/navigation/controllers/shell_controller.dart';
+import 'package:wavely/features/room/services/local_network_permission.dart';
+
+import 'support/fake_local_network_permission.dart';
 
 /// Stands in for a user who declined the media permission.
 class _DeniedMediaService extends LocalMediaService {
@@ -63,6 +66,11 @@ Widget _wrap(LibraryController library, {ShellController? shell}) {
       ),
       ChangeNotifierProvider(create: (_) => PlayerController()),
       ChangeNotifierProvider.value(value: library),
+      // The app asks for local-network access on its first frame; answered here
+      // so the widget can be mounted without the full provider tree.
+      Provider<LocalNetworkPermission>.value(
+        value: FakeLocalNetworkPermission(),
+      ),
     ],
     child: const WavelyApp(),
   );
@@ -77,6 +85,9 @@ void main() {
           ChangeNotifierProvider(create: (_) => ShellController()),
           ChangeNotifierProvider(create: (_) => PlayerController()),
           ChangeNotifierProvider(create: (_) => LibraryController()),
+          Provider<LocalNetworkPermission>.value(
+            value: FakeLocalNetworkPermission(),
+          ),
         ],
         child: const WavelyApp(),
       ),

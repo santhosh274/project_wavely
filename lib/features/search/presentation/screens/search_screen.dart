@@ -3,8 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:wavely/core/models/song_model.dart';
 import 'package:wavely/core/theme/ios27_colors.dart';
-import 'package:wavely/core/widgets/glass_container.dart';
 import 'package:wavely/features/library/controllers/library_controller.dart';
+import 'package:wavely/features/library/presentation/widgets/song_context_menu.dart';
 import 'package:wavely/features/library/presentation/widgets/song_tile.dart';
 import 'package:wavely/features/player/controllers/player_controller.dart';
 
@@ -69,11 +69,13 @@ class _SearchScreenState extends State<SearchScreen> {
             ),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16.0),
-              child: GlassContainer(
-                borderRadius: 100.0,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16.0,
-                  vertical: 4.0,
+              // Rounded light-fill field, the Apple Music / Google search
+              // shape: a soft translucent pill with a quiet magnifier, no
+              // glass chrome competing with the results below.
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(28.0),
                 ),
                 child: TextField(
                   controller: _queryController,
@@ -82,7 +84,10 @@ class _SearchScreenState extends State<SearchScreen> {
                   onChanged: libraryCtrl.setSearchQuery,
                   onSubmitted: (_) => _focusNode.unfocus(),
                   style: const TextStyle(color: Colors.white),
+                  cursorColor: Colors.white,
                   decoration: InputDecoration(
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(vertical: 12.0),
                     hintText: 'Title, artist, album or genre',
                     hintStyle: TextStyle(
                       color: Colors.white.withValues(alpha: 0.5),
@@ -252,16 +257,27 @@ class _Results extends StatelessWidget {
         Expanded(
           child: ListView.builder(
             itemCount: results.length,
-            padding: const EdgeInsets.only(bottom: 150.0),
+            itemExtent: 68.0,
+            padding: const EdgeInsets.only(bottom: 196.0),
             addAutomaticKeepAlives: false,
             itemBuilder: (context, index) {
               final song = results[index];
               return SongTile(
+                // Keyed by song so typing filters the existing rows instead of
+                // rebuilding every one from scratch -- which would throw away
+                // each cover's decoded bytes on every keystroke.
+                key: ValueKey(song.id),
                 song: song,
                 isCurrent: playerCtrl.currentSong?.id == song.id,
                 isPlaying: playerCtrl.isPlaying,
                 onTap: () => playerCtrl.playTrack(
                   song,
+                  queueContext: results,
+                  queueTitle: _queueTitle(),
+                ),
+                onLongPress: () => showSongContextMenu(
+                  context,
+                  song: song,
                   queueContext: results,
                   queueTitle: _queueTitle(),
                 ),

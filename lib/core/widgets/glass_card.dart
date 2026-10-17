@@ -15,6 +15,10 @@ class GlassCard extends StatefulWidget {
   final bool isSelected;
   final Color? glowColor;
 
+  /// Whether the card renders as a solid, opaque slab instead of glass.
+  /// See [GlassContainer.opaque].
+  final bool opaque;
+
   /// Whether the card really blurs what is behind it. Off by default.
   ///
   /// Cards are list and grid rows: a library screen can have dozens on screen
@@ -36,6 +40,7 @@ class GlassCard extends StatefulWidget {
     this.borderRadius = IOS27GlassTheme.radiusMedium,
     this.isSelected = false,
     this.glowColor,
+    this.opaque = false,
     this.backdrop = false,
   });
 
@@ -102,17 +107,26 @@ class _GlassCardState extends State<GlassCard> with SingleTickerProviderStateMix
             margin: widget.margin,
             borderRadius: widget.borderRadius,
             backdrop: widget.backdrop,
+            opaque: widget.opaque,
             borderColor: widget.isSelected
                 ? glow.withValues(alpha: 0.8)
                 : (isDark ? Colors.white.withValues(alpha: 0.18) : Colors.white.withValues(alpha: 0.6)),
             borderWidth: widget.isSelected ? 2.0 : 1.0,
             shadows: widget.isSelected
                 ? [
-                    BoxShadow(
-                      color: glow.withValues(alpha: 0.4),
-                      blurRadius: 20,
-                      spreadRadius: 2,
-                    ),
+                    // Opaque rows read as raised slabs: shadow, not glow.
+                    if (widget.opaque)
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.45),
+                        blurRadius: 14,
+                        offset: const Offset(0, 5),
+                      )
+                    else
+                      BoxShadow(
+                        color: glow.withValues(alpha: 0.4),
+                        blurRadius: 20,
+                        spreadRadius: 2,
+                      ),
                   ]
                 : null,
             child: widget.child,

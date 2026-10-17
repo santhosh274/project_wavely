@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -5,16 +7,25 @@ import 'package:just_audio_background/just_audio_background.dart';
 import 'package:provider/provider.dart';
 
 import 'app/wavely_providers.dart';
+import 'core/services/playback_state_store.dart';
 import 'core/theme/ios27_colors.dart';
 import 'core/theme/ios27_glass_theme.dart';
 import 'core/theme/theme_controller.dart';
 import 'core/widgets/artwork_image.dart';
 import 'features/navigation/presentation/screens/main_navigation_screen.dart';
 import 'features/player/controllers/player_controller.dart';
+import 'features/room/services/local_network_permission.dart';
 import 'features/settings/presentation/screens/settings_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Read the last session while the audio session is being set up. The two are
+  // independent, and this read is otherwise the first thing the player does on
+  // its own first frame -- so overlapping it with the audio-session setup takes
+  // it off the path that decides what the very first frame shows.
+  final stateStore = FilePlaybackStateStore();
+  final storedSession = stateStore.read();
 
   // Runs the player inside a media session hosted by a foreground service.
   // This is what keeps the music going when the app is minimised or the screen
@@ -64,7 +75,18 @@ Future<void> main() async {
     ),
   );
 
-  runApp(MultiProvider(providers: wavelyProviders(), child: const WavelyApp()));
+  runApp(
+    MultiProvider(
+      providers: wavelyProviders(
+        stateStore: stateStore,
+        // Already read by now, most likely: it started before the audio session
+        // was set up. Falling through to the player's own read would only repeat
+        // work the launch is already doing.
+        initialSnapshot: await storedSession,
+      ),
+      child: const WavelyApp(),
+    ),
+  );
 }
 
 class WavelyApp extends StatefulWidget {
@@ -79,6 +101,18 @@ class _WavelyAppState extends State<WavelyApp> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // Asked once at launch, the same way the media permission is: a listening
+    // room is built on local-network sockets, and Android 17 gates them behind
+    // this prompt, so raising it here is what keeps the user from meeting it for
+    // the first time halfway through opening a room. Deferred to the first frame
+    // because a system dialog needs a foreground Activity, which does not exist
+    // while the provider tree is still being built. A no-op wherever the
+    // platform does not gate the local network, so nothing is shown on a phone
+    // that never restricted it.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(context.read<LocalNetworkPermission>().request());
+    });
   }
 
   @override

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:wavely/core/theme/ios27_colors.dart';
 import 'package:wavely/core/theme/ios27_glass_theme.dart';
 import 'glass_container.dart';
 
@@ -81,12 +82,7 @@ class _GlassButtonState extends State<GlassButton> with SingleTickerProviderStat
 
   @override
   Widget build(BuildContext context) {
-    final accent = widget.accentColor ?? Theme.of(context).colorScheme.primary;
-    // Darkened toward black so the white glyph stays readable on light
-    // artwork hues (sky blues, yellows): a translucent lifted colour over a
-    // bright backdrop washes the icon out. The hue is preserved, only the
-    // luminance drops, and the outer glow keeps the un-darkened accent.
-    final fill = Color.lerp(accent, Colors.black, 0.32)!;
+    final accent = widget.accentColor ?? IOS27Colors.electricIndigo;
 
     return GestureDetector(
       onTapDown: (_) => _animController.forward(),
@@ -104,10 +100,10 @@ class _GlassButtonState extends State<GlassButton> with SingleTickerProviderStat
             padding: widget.padding,
             borderRadius: widget.borderRadius,
             tintColor: widget.isPrimary
-                ? fill.withValues(alpha: 0.85)
+                ? accent.withValues(alpha: 0.55)
                 : null,
             borderColor: widget.isPrimary
-                ? accent.withValues(alpha: 0.9)
+                ? accent.withValues(alpha: 0.8)
                 : null,
             shadows: widget.isPrimary
                 ? [

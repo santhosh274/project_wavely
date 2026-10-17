@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:wavely/core/models/song_model.dart';
 import 'package:wavely/features/library/controllers/library_controller.dart';
+import 'package:wavely/features/library/presentation/widgets/song_context_menu.dart';
 import 'package:wavely/features/library/presentation/widgets/song_tile.dart';
 import 'package:wavely/features/player/controllers/player_controller.dart';
 import 'package:wavely/core/theme/ios27_colors.dart';
@@ -50,45 +51,70 @@ class TrackCollectionScreen extends StatelessWidget {
       backgroundColor: Colors.black,
       // Plain black backdrop: the artwork wash is the expanded player's.
       body: SafeArea(
-          child: Column(
-            children: [
-              _Header(
-                title: title,
-                subtitle: subtitle,
-                icon: icon,
-                onBack: () => Navigator.of(context).maybePop(),
-                actions: actionsOf?.call(libraryCtrl) ?? const [],
-                songCount: songs.length,
-                totalDuration: libraryCtrl.totalDurationOf(songs),
-                onPlayAll: songs.isEmpty
-                    ? null
-                    : () => playerCtrl.playTrack(
-                          songs.first,
-                          queueContext: songs,
-                          queueTitle: title,
-                        ),
-                onShuffleAll: songs.length < 2
-                    ? null
-                    : () => _shuffleAndPlay(context, playerCtrl, songs),
-              ),
-              Expanded(
-                child: songs.isEmpty
-                    ? _EmptyCollection(
-                        icon: icon,
-                        kind: kind,
-                        onBack: () => Navigator.of(context).maybePop(),
-                      )
-                    : ListView.builder(
-                        itemCount: songs.length,
-                        padding: const EdgeInsets.only(top: 8.0, bottom: 32.0),
-                        itemBuilder: (context, index) {
+        child: songs.isEmpty
+            ? Column(
+                children: [
+                  _Header(
+                    title: title,
+                    subtitle: subtitle,
+                    icon: icon,
+                    onBack: () => Navigator.of(context).maybePop(),
+                    actions: actionsOf?.call(libraryCtrl) ?? const [],
+                    songCount: songs.length,
+                    totalDuration: libraryCtrl.totalDurationOf(songs),
+                    onPlayAll: null,
+                    onShuffleAll: null,
+                  ),
+                  Expanded(
+                    child: _EmptyCollection(
+                      icon: icon,
+                      kind: kind,
+                      onBack: () => Navigator.of(context).maybePop(),
+                    ),
+                  ),
+                ],
+              )
+            : CustomScrollView(
+                slivers: [
+                  SliverToBoxAdapter(
+                    child: _Header(
+                      title: title,
+                      subtitle: subtitle,
+                      icon: icon,
+                      onBack: () => Navigator.of(context).maybePop(),
+                      actions: actionsOf?.call(libraryCtrl) ?? const [],
+                      songCount: songs.length,
+                      totalDuration: libraryCtrl.totalDurationOf(songs),
+                      onPlayAll: () => playerCtrl.playTrack(
+                        songs.first,
+                        queueContext: songs,
+                        queueTitle: title,
+                      ),
+                      onShuffleAll: songs.length < 2
+                          ? null
+                          : () => _shuffleAndPlay(context, playerCtrl, songs),
+                    ),
+                  ),
+                  SliverPadding(
+                    padding: const EdgeInsets.only(top: 8.0, bottom: 32.0),
+                    sliver: SliverFixedExtentList(
+                      itemExtent: 68.0,
+                      delegate: SliverChildBuilderDelegate(
+                        (context, index) {
                           final song = songs[index];
                           return SongTile(
+                            key: ValueKey(song.id),
                             song: song,
                             isCurrent: playerCtrl.currentSong?.id == song.id,
                             isPlaying: playerCtrl.isPlaying,
                             onTap: () => playerCtrl.playTrack(
                               song,
+                              queueContext: songs,
+                              queueTitle: title,
+                            ),
+                            onLongPress: () => showSongContextMenu(
+                              context,
+                              song: song,
                               queueContext: songs,
                               queueTitle: title,
                             ),
@@ -101,10 +127,13 @@ class TrackCollectionScreen extends StatelessWidget {
                             },
                           );
                         },
+                        childCount: songs.length,
+                        addAutomaticKeepAlives: false,
                       ),
+                    ),
+                  ),
+                ],
               ),
-            ],
-          ),
       ),
     );
   }

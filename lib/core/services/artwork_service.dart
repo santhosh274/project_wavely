@@ -51,6 +51,23 @@ class ArtworkService {
   bool isCached(WavelySong song) =>
       song.albumId != null && _cache.containsKey(song.albumId!);
 
+  /// The bytes already held for [song]'s album, available without a future.
+  ///
+  /// A cache hit has to be readable on the very frame a widget first builds:
+  /// changing track re-points the cover widgets at a new song, and going
+  /// through [artworkFor] -- even when it resolves from the cache -- still
+  /// costs a microtask, so the cover was replaced by the placeholder for a
+  /// frame on every track change. Reading synchronously lets that frame paint
+  /// the real cover instead.
+  ///
+  /// Null means "nothing cached", which [isCached] distinguishes from "cached
+  /// and the device has no cover".
+  Uint8List? cachedArtworkFor(WavelySong song) {
+    final albumId = song.albumId;
+    if (albumId == null) return null;
+    return _cache[albumId];
+  }
+
   /// The artwork for [song], or null when the device has none for it.
   ///
   /// Cached on the album rather than the track, because every song on an album

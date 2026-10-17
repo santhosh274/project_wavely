@@ -29,7 +29,27 @@ class GlassContainer extends StatelessWidget {
   /// (the navigation bar, the mini player, the search field).
   final bool backdrop;
 
+  /// Whether the surface is a solid, opaque slab rather than glass.
+  ///
+  /// Used by the selected song row: a fully opaque elevated slate with no
+  /// sheen and no translucent white gradient. The sheen's diagonal light band
+  /// and the glass gradient are exactly what read as a "foggy" bright middle
+  /// on a selected row -- selection wants contrast against the glass rows
+  /// around it, not more glass.
+  final bool opaque;
+
   final VoidCallback? onTap;
+
+  /// Vertical-drag callbacks for surfaces that answer a swipe as well as a tap.
+  ///
+  /// They ride on the same [GestureDetector] as [onTap] rather than wrapping
+  /// the surface in a second one, because two competing recognizers make a tap
+  /// and a swipe argue over the same pointer -- one flat detector lets a tap win
+  /// taps and a drag win drags. The mini player uses these to open on an upward
+  /// flick, mirroring the pull-down that closes the player.
+  final GestureDragStartCallback? onVerticalDragStart;
+  final GestureDragUpdateCallback? onVerticalDragUpdate;
+  final GestureDragEndCallback? onVerticalDragEnd;
 
   /// Announced by screen readers when [onTap] makes the surface a control.
   ///
@@ -54,9 +74,31 @@ class GlassContainer extends StatelessWidget {
     this.borderWidth = 1.0,
     this.shadows,
     this.backdrop = true,
+    this.opaque = false,
     this.onTap,
+    this.onVerticalDragStart,
+    this.onVerticalDragUpdate,
+    this.onVerticalDragEnd,
     this.semanticLabel,
   });
+
+  static const List<BoxShadow> _darkShadows = [
+    BoxShadow(
+      color: Color(0x59000000),
+      blurRadius: 24,
+      spreadRadius: -4,
+      offset: Offset(0, 12),
+    ),
+  ];
+
+  static const List<BoxShadow> _lightShadows = [
+    BoxShadow(
+      color: Color(0x14000000),
+      blurRadius: 24,
+      spreadRadius: -4,
+      offset: Offset(0, 12),
+    ),
+  ];
 
   @override
   Widget build(BuildContext context) {
@@ -70,15 +112,7 @@ class GlassContainer extends StatelessWidget {
         ? IOS27Colors.glassDarkBorder
         : IOS27Colors.glassLightBorder;
 
-    final defaultShadows = shadows ??
-        [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: isDark ? 0.35 : 0.08),
-            blurRadius: 24,
-            spreadRadius: -4,
-            offset: const Offset(0, 12),
-          ),
-        ];
+    final defaultShadows = shadows ?? (isDark ? _darkShadows : _lightShadows);
 
     final radius = BorderRadius.circular(borderRadius);
 
@@ -86,19 +120,22 @@ class GlassContainer extends StatelessWidget {
     // the way a real piece of glass catches a light source. Drawn through
     // [foregroundDecoration] so it sits above the content like a reflection
     // would, at alphas low enough that text under it stays readable.
-    final sheen = BoxDecoration(
-      borderRadius: radius,
-      gradient: LinearGradient(
-        colors: [
-          Colors.white.withValues(alpha: isDark ? 0.10 : 0.22),
-          Colors.white.withValues(alpha: 0.0),
-          Colors.white.withValues(alpha: isDark ? 0.04 : 0.07),
-        ],
-        stops: const [0.0, 0.45, 1.0],
-        begin: Alignment.topLeft,
-        end: Alignment.bottomRight,
-      ),
-    );
+    // Skipped for opaque surfaces: a solid slab catches no light.
+    final sheen = opaque
+        ? null
+        : BoxDecoration(
+            borderRadius: radius,
+            gradient: LinearGradient(
+              colors: [
+                Colors.white.withValues(alpha: isDark ? 0.10 : 0.22),
+                Colors.white.withValues(alpha: 0.0),
+                Colors.white.withValues(alpha: isDark ? 0.04 : 0.07),
+              ],
+              stops: const [0.0, 0.45, 1.0],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+          );
 
     Widget content = Container(
       width: width,
@@ -121,14 +158,22 @@ class GlassContainer extends StatelessWidget {
 
     // The sheen is painted over the whole surface, including the border, so
     // it wraps the clip rather than the padded content box.
-    content = Container(
-      foregroundDecoration: sheen,
-      child: content,
-    );
+    if (sheen != null) {
+      content = Container(
+        foregroundDecoration: sheen,
+        child: content,
+      );
+    }
 
-    if (onTap != null) {
+    if (onTap != null ||
+        onVerticalDragStart != null ||
+        onVerticalDragUpdate != null ||
+        onVerticalDragEnd != null) {
       Widget tappable = GestureDetector(
         onTap: onTap,
+        onVerticalDragStart: onVerticalDragStart,
+        onVerticalDragUpdate: onVerticalDragUpdate,
+        onVerticalDragEnd: onVerticalDragEnd,
         behavior: HitTestBehavior.opaque,
         child: content,
       );
@@ -162,25 +207,31 @@ class GlassContainer extends StatelessWidget {
     final surface = Container(
       padding: padding,
       decoration: BoxDecoration(
-        color: tintColor ?? tint,
+        // Opaque mode: one solid colour, no translucent white gradient --
+        // that gradient is the fog a selected row must not have.
+        color: opaque
+            ? (isDark ? const Color(0xFF1C2028) : Colors.white)
+            : tintColor ?? tint,
         borderRadius: radius,
         border: Border.all(
           color: borderColor ?? border,
           width: borderWidth,
         ),
-        gradient: LinearGradient(
-          colors: isDark
-              ? [
-                  Colors.white.withValues(alpha: 0.12),
-                  Colors.white.withValues(alpha: 0.02),
-                ]
-              : [
-                  Colors.white.withValues(alpha: 0.6),
-                  Colors.white.withValues(alpha: 0.2),
-                ],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
+        gradient: opaque
+            ? null
+            : LinearGradient(
+                colors: isDark
+                    ? [
+                        Colors.white.withValues(alpha: 0.12),
+                        Colors.white.withValues(alpha: 0.02),
+                      ]
+                    : [
+                        Colors.white.withValues(alpha: 0.6),
+                        Colors.white.withValues(alpha: 0.2),
+                      ],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
       ),
       child: child,
     );

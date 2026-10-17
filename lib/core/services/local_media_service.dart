@@ -155,6 +155,19 @@ class LocalMediaService {
     return trimmed;
   }
 
+  /// The file's size in bytes, or null when the media store did not report one.
+  ///
+  /// [SongModel] is a map wrapper whose `size` getter is typed non-null, so a
+  /// row that genuinely lacks the column would throw on a cast rather than
+  /// returning null -- and that would fail the whole scan over one odd file.
+  int? _fileSizeOf(SongModel s) {
+    try {
+      return s.size;
+    } on Object {
+      return null;
+    }
+  }
+
   WavelySong _mapSong(SongModel s) {
     return WavelySong(
       id: s.id.toString(),
@@ -174,6 +187,7 @@ class LocalMediaService {
           : 'content://media/external/audio/albumart/${s.albumId}',
       genre: _cleanOrNull(s.genre),
       trackNumber: s.track,
+      fileSize: _fileSizeOf(s),
     );
   }
 

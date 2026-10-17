@@ -22,7 +22,18 @@ launch and can be re-granted from the in-app prompt or the OS settings page.
 | Android 13+ (API 33) | `READ_MEDIA_AUDIO` |
 | Android 12 and below | `READ_EXTERNAL_STORAGE` |
 | Android (playback) | `MODIFY_AUDIO_SETTINGS` |
-| iOS | `NSAppleMusicUsageDescription` |
+| Android (listening rooms) | `INTERNET` |
+| Android 17+ (API 37, listening rooms) | `ACCESS_LOCAL_NETWORK` |
+| iOS | `NSAppleMusicUsageDescription`, `NSLocalNetworkUsageDescription` |
+
+`INTERNET` is a normal permission: Android grants it at install and never shows
+a prompt, so its absence from the runtime list is expected. The one network
+permission that is asked for is `ACCESS_LOCAL_NETWORK`, and only builds
+targeting SDK 37 have to ask -- which this app does (`targetSdk = 37` in
+`android/app/build.gradle.kts`). On a lower target Android grants local-network
+access implicitly through `INTERNET` and shows nothing, which is why the prompt
+never appeared before. On iOS the local-network prompt is raised by the system
+on first LAN access rather than from the app.
 
 On Android, `permission_handler` needs macro definitions in the iOS `Podfile`
 to compile its permission code. Without them the app still builds, but

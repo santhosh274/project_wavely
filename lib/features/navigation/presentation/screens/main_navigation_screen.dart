@@ -96,8 +96,14 @@ class MainNavigationScreen extends StatelessWidget {
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      if (showMini) const MiniPlayer(),
-                      GlassNavigationBar(
+                      // Each dock card gets its own repaint layer: they float
+                      // over every tab and blur what is behind them, so
+                      // isolating them keeps a scrolling list and the dock from
+                      // repainting each other.
+                      if (showMini)
+                        const RepaintBoundary(child: MiniPlayer()),
+                      RepaintBoundary(
+                        child: GlassNavigationBar(
                         currentIndex: shellCtrl.currentIndex,
                         onTap: shellCtrl.selectTab,
                   items: const [
@@ -123,6 +129,7 @@ class MainNavigationScreen extends StatelessWidget {
                     ),
                   ],
                         ),
+                      ),
                     ],
                   ),
                 ),

@@ -11,6 +11,39 @@
     <!-- Needed to change volume / mute during playback. -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
+    <!-- Listening rooms. The host binds a socket on the local network and the
+         guests dial it, plus a small HTTP server the host serves a missing
+         track from - all local traffic, but a socket is a socket, and without
+         this the release build throws on the first connection attempt. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="33"
+        tools:ignore="UnusedAttribute" />
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="32" />
+
+    <!-- Listening rooms again, for Android 17. From API 37 the platform gates
+         every local-network socket behind ACCESS_LOCAL_NETWORK, and a room is
+         nothing but local-network sockets: the host's listening socket and the
+         track it serves are both refused without it. Declaring it is also what
+         makes the permission appear in the app's settings, where the user can
+         see and grant it.
+
+         The app targets 37 (android/app/build.gradle.kts), which is what makes
+         the platform enforce this at all: a lower target is granted LAN access
+         implicitly through INTERNET and never shows a prompt. The request
+         itself is `Permission.accessLocalNetwork`, raised at launch and again
+         before a room opens (see LocalNetworkPermission). INTERNET stays
+         declared because it is still what grants general internet access, and
+         it is install-time: there is no prompt for it on any Android version. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+
     <!-- Background playback. Without a foreground service Android stops the
          player as soon as the app is no longer in front, which for a music player
          means the music dies the moment it is minimised. -->

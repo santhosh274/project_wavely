@@ -16,12 +16,21 @@ class MemoryPlaybackStateStore implements PlaybackStateStore {
   /// rather than done on every playhead tick.
   int writes = 0;
 
+  /// How many times the snapshot was read.
+  ///
+  /// Lets a test prove a snapshot preloaded at startup is used instead of being
+  /// read from the store all over again.
+  int reads = 0;
+
   /// Set to make the next write throw, standing in for a device that cannot
   /// write its storage. Playback has to carry on regardless.
   Object? failWith;
 
   @override
-  Future<PlaybackSnapshot?> read() async => snapshot;
+  Future<PlaybackSnapshot?> read() async {
+    reads++;
+    return snapshot;
+  }
 
   @override
   Future<void> write(PlaybackSnapshot next) async {

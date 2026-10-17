@@ -28,9 +28,7 @@ class GlassSlider extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // Falls back to the app accent -- which tracks the playing artwork --
-    // so seek and volume bars follow the track unless given an explicit hue.
-    final active = activeColor ?? Theme.of(context).colorScheme.primary;
+    final active = activeColor ?? IOS27Colors.electricIndigo;
     final inactive = inactiveColor ?? Colors.white.withValues(alpha: 0.15);
 
     final clampedValue = value.clamp(min, max);

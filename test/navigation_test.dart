@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -5,12 +7,16 @@ import 'package:provider/provider.dart';
 import 'package:wavely/app/wavely_providers.dart';
 import 'package:wavely/core/services/audio_player_service.dart'
     show RepeatBehaviour;
+import 'package:wavely/core/services/playback_state_store.dart';
 import 'package:wavely/features/library/controllers/library_controller.dart';
 import 'package:wavely/features/library/presentation/widgets/song_tile.dart';
 import 'package:wavely/features/navigation/controllers/shell_controller.dart';
 import 'package:wavely/features/navigation/presentation/screens/main_navigation_screen.dart'
     show ShellTabs;
 import 'package:wavely/features/player/controllers/player_controller.dart';
+import 'package:wavely/features/player/presentation/screens/now_playing_expanded_screen.dart';
+import 'package:wavely/features/player/presentation/widgets/artwork_flight.dart';
+import 'package:wavely/features/player/presentation/widgets/mini_player.dart';
 import 'package:wavely/main.dart';
 
 import 'support/fake_artwork_service.dart';
@@ -91,6 +97,26 @@ void main() {
   /// The navigation bar only labels the selected tab, so an unselected tab is
   /// found by its icon instead.
   Finder navIcon(IconData icon) => find.byIcon(icon).last;
+
+  /// The fade the expanded player opens and closes with.
+  ///
+  /// Reached with `skipOffstage: false` on purpose: off its own tab the player
+  /// is hidden from the default finders, and what this is asked about is the
+  /// state it is left in *while* hidden -- which is what decides whether the
+  /// next visit shows anything at all.
+  FadeTransition revealFade(WidgetTester tester) =>
+      tester.widget<FadeTransition>(
+        find
+            .descendant(
+              of: find.byType(
+                NowPlayingExpandedScreen,
+                skipOffstage: false,
+              ),
+              matching: find.byType(FadeTransition, skipOffstage: false),
+              skipOffstage: false,
+            )
+            .first,
+      );
 
   /// Scroll a label into view and tap it.
   ///
@@ -184,6 +210,56 @@ void main() {
       });
     });
 
+    testWidgets('its play/pause glyph follows the player state', (tester) async {
+      await playFirstTrack(tester);
+
+      final mini = find.byType(MiniPlayer);
+      // Playing: the mini player has to offer pause, not the play it opened on.
+      expect(
+        find.descendant(
+          of: mini,
+          matching: find.byIcon(CupertinoIcons.pause_fill),
+        ),
+        findsOneWidget,
+      );
+
+      await player.togglePlayPause();
+      await tester.pumpAndSettle();
+
+      expect(
+        find.descendant(
+          of: mini,
+          matching: find.byIcon(CupertinoIcons.play_fill),
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('swiping it up opens the expanded player', (tester) async {
+      await withSemantics(tester, () async {
+        // Real covers: the flight only runs when it has pixels to carry.
+        artwork = FakeArtworkService(artwork: testArtworkPng);
+        await playFirstTrack(tester);
+        expect(shell.currentIndex, ShellTabs.home);
+
+        // The mirror of pulling the expanded player down: an upward flick on
+        // the mini player should send its cover up into the player.
+        await tester.dragFrom(
+          tester.getCenter(miniPlayerTap()),
+          const Offset(0, -120),
+        );
+        await tester.pump();
+
+        expect(ArtworkFlight.inFlight, isTrue);
+        expect(shell.currentIndex, ShellTabs.player);
+
+        await tester.pumpAndSettle();
+        expect(ArtworkFlight.inFlight, isFalse);
+
+        await tester.pump(const Duration(seconds: 16));
+      });
+    });
+
     testWidgets('the expanded player goes back to the home tab, not a pop', (
       tester,
     ) async {
@@ -198,6 +274,50 @@ void main() {
         await tester.pumpAndSettle();
 
         expect(shell.currentIndex, ShellTabs.home);
+      });
+    });
+
+    testWidgets(
+      'the expanded cover is laid out before its tab opens, so the flight has '
+      'a real destination to aim at',
+      (tester) async {
+        await playFirstTrack(tester);
+
+        // Still on the home tab, and yet the destination cover already has a
+        // laid-out rect. The shell keeps every tab laid out, which is the whole
+        // reason the flight can land exactly on it rather than guessing a size.
+        expect(shell.currentIndex, ShellTabs.home);
+        final box = ArtworkFlight.expandedArt.currentContext
+            ?.findRenderObject() as RenderBox?;
+        expect(box, isNotNull);
+        expect(box!.hasSize, isTrue);
+        expect(box.size.width, greaterThan(100.0));
+      },
+    );
+
+    testWidgets('the cover flies from the mini player into the expanded player',
+        (tester) async {
+      await withSemantics(tester, () async {
+        // A device with real covers: the flight only runs when it has pixels to
+        // carry, and the point is to prove it does carry them.
+        artwork = FakeArtworkService(artwork: testArtworkPng);
+        await playFirstTrack(tester);
+
+        await tester.tap(miniPlayerTap());
+        await tester.pump();
+
+        // Mid-flight the cover is in the overlay, above both screens.
+        expect(ArtworkFlight.inFlight, isTrue);
+
+        await tester.pumpAndSettle();
+
+        expect(ArtworkFlight.inFlight, isFalse);
+        expect(shell.currentIndex, ShellTabs.player);
+
+        // The palette read is fire-and-forget and only reaches its own timeout
+        // in this harness, so the clock is advanced past it rather than leaving
+        // a timer pending at teardown.
+        await tester.pump(const Duration(seconds: 16));
       });
     });
 
@@ -386,6 +506,23 @@ void main() {
 
       expect(find.text('Profile'), findsNothing);
       expect(shell.currentIndex, ShellTabs.home);
+    });
+
+    testWidgets('the profile page exposes the library filters', (tester) async {
+      await pumpApp(tester);
+
+      await tester.tap(find.byTooltip('Profile, settings and stats'));
+      await tester.pumpAndSettle();
+
+      // The section sits below the fold on a phone-sized screen.
+      await tester.scrollUntilVisible(find.text('LIBRARY FILTERS'), 300.0);
+      await tester.pumpAndSettle();
+
+      expect(find.text('Hide short tracks'), findsOneWidget);
+      expect(find.text('Excluded folders'), findsOneWidget);
+      // The fixture's tracks are content:// URIs, so no folder can be derived --
+      // the row says so rather than offering an empty picker.
+      expect(find.text('No folders detected in this library'), findsOneWidget);
     });
   });
 
@@ -615,5 +752,335 @@ void main() {
         expect(shell.currentIndex, kPlayerTabIndex);
       });
     });
+  });
+
+  // Opening the app, before the library has been read at all. This is the window
+  // the user actually sees on launch, and it used to show an empty player: the
+  // stored session could only be rebuilt once the media store had answered.
+  group('opening the app', () {
+    testWidgets('the last session is on screen while the scan is still running', (
+      tester,
+    ) async {
+      final songs = libraryFixture();
+      store.snapshot = PlaybackSnapshot.of(
+        songs: songs,
+        index: 1,
+        position: const Duration(seconds: 30),
+        wasPlaying: true,
+        shuffle: false,
+        repeatMode: RepeatBehaviour.off,
+        volume: 0.8,
+        queueTitle: 'All Songs',
+        savedAt: DateTime(2026, 1, 1),
+      );
+      // The media store has not answered, and will not until this test says so.
+      final gate = Completer<void>();
+      media.scanGate = gate;
+
+      await pumpApp(tester);
+
+      expect(player.currentSong?.id, songs[1].id);
+      expect(player.isPlaying, isTrue);
+      expect(find.text('No music playing'), findsNothing);
+      // The whole list is there too, not just the one track.
+      expect(find.text('Aurora Fields'), findsWidgets);
+      expect(find.textContaining('playing 2 of 4'), findsOneWidget);
+
+      gate.complete();
+      media.scanGate = null;
+      await tester.pumpAndSettle();
+
+      // The scan landing changes nothing about what is playing.
+      expect(player.currentSong?.id, songs[1].id);
+      expect(player.queue, hasLength(songs.length));
+
+      await tester.pump(const Duration(seconds: 16));
+    });
+
+    testWidgets('a session of ids is restored by the scan that can resolve it', (
+      tester,
+    ) async {
+      final songs = libraryFixture();
+      // What an older build stored: ids only, so there is nothing to build a
+      // queue out of until the media store has answered. Waiting is the only
+      // option for it -- the point is that it still lands.
+      store.snapshot = PlaybackSnapshot(
+        songIds: [songs[1].id, songs[0].id],
+        index: 0,
+        position: const Duration(seconds: 12),
+        wasPlaying: false,
+        shuffle: false,
+        repeatMode: RepeatBehaviour.off,
+        volume: 0.8,
+        savedAt: DateTime(2026, 1, 1),
+      );
+      final gate = Completer<void>();
+      media.scanGate = gate;
+
+      await pumpApp(tester);
+      expect(player.currentSong, isNull);
+
+      gate.complete();
+      media.scanGate = null;
+      await tester.pumpAndSettle();
+
+      expect(player.currentSong?.id, songs[1].id);
+      expect(player.position, const Duration(seconds: 12));
+      expect(player.isPlaying, isFalse);
+      expect(find.text('No music playing'), findsNothing);
+    });
+  });
+
+  group('song actions', () {
+    testWidgets('holding a row opens its action sheet', (tester) async {
+      await playFirstTrack(tester);
+
+      await tester.longPress(find.byType(SongTile).first);
+      await tester.pumpAndSettle();
+
+      expect(find.text('Play now'), findsOneWidget);
+      expect(find.text('Add to playlist'), findsOneWidget);
+      expect(find.text('Track details'), findsOneWidget);
+      expect(find.text('Share'), findsOneWidget);
+    });
+
+    testWidgets('adding to a playlist from the sheet files the track there', (
+      tester,
+    ) async {
+      await playFirstTrack(tester);
+
+      await tester.longPress(find.byType(SongTile).first);
+      await tester.pumpAndSettle();
+
+      // The playlist list is folded away until it is asked for.
+      expect(find.text('Folk'), findsNothing);
+
+      await tester.tap(find.text('Add to playlist'));
+      await tester.pumpAndSettle();
+      expect(find.text('Folk'), findsOneWidget);
+
+      await tester.ensureVisible(find.text('Folk'));
+      await tester.tap(find.text('Folk'));
+      await tester.pumpAndSettle();
+
+      // The tapped row is Neon Tide, tagged Ambient, so adding it to Folk is a
+      // real change to the library rather than a no-op.
+      expect(library.playlistContains('genre-folk', '1'), isTrue);
+
+      // Let the confirmation snackbar's timer fire rather than leaving it
+      // pending at teardown.
+      await tester.pump(const Duration(seconds: 5));
+    });
+
+    testWidgets('a playlist can be created straight from the sheet', (
+      tester,
+    ) async {
+      await playFirstTrack(tester);
+
+      await tester.longPress(find.byType(SongTile).first);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Add to playlist'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('New playlist'));
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField).last, 'Road Trip');
+      await tester.tap(find.text('Create'));
+      await tester.pumpAndSettle();
+
+      final created = library.userPlaylists.single;
+      expect(created.name, 'Road Trip');
+      expect(created.songIds, contains('1'));
+
+      await tester.pump(const Duration(seconds: 5));
+    });
+  });
+
+  group('cover flight', () {
+    testWidgets(
+      'the player is revealed as the cover travels, not after it lands',
+      (tester) async {
+        await withSemantics(tester, () async {
+          // Real covers: the flight only runs when it has pixels to carry.
+          artwork = FakeArtworkService(artwork: testArtworkPng);
+          await playFirstTrack(tester);
+          final revealsBefore = ArtworkFlight.revealTick.value;
+
+          await tester.tap(miniPlayerTap());
+          await tester.pump();
+
+          // The reveal is signalled on the very first frame and the tab has
+          // already switched, so the player starts fading in from the same
+          // instant the cover sets off.
+          expect(ArtworkFlight.revealTick.value, greaterThan(revealsBefore));
+          expect(shell.currentIndex, ShellTabs.player);
+
+          // Mid-travel the cover is still in the air, and the player is only
+          // part-way through its fade: the expansion and the reveal are running
+          // together, which is the whole point of the flow.
+          await tester.pump(const Duration(milliseconds: 120));
+          expect(ArtworkFlight.inFlight, isTrue);
+          final fades = tester.widgetList<FadeTransition>(
+            find.ancestor(
+              of: find.byTooltip('Collapse player'),
+              matching: find.byType(FadeTransition),
+            ),
+          );
+          expect(
+            fades.any(
+              (fade) => fade.opacity.value > 0.0 && fade.opacity.value < 1.0,
+            ),
+            isTrue,
+            reason: 'the expanded player should be fading in mid-flight',
+          );
+
+          await tester.pump(const Duration(milliseconds: 80));
+          expect(ArtworkFlight.inFlight, isTrue);
+
+          await tester.pumpAndSettle();
+          expect(ArtworkFlight.inFlight, isFalse);
+
+          await tester.pump(const Duration(seconds: 16));
+        });
+      },
+    );
+
+    testWidgets(
+      'pulling the player down collapses the cover back to the mini player',
+      (tester) async {
+        await withSemantics(tester, () async {
+          artwork = FakeArtworkService(artwork: testArtworkPng);
+          await playFirstTrack(tester);
+
+          await tester.tap(miniPlayerTap());
+          await tester.pumpAndSettle();
+          expect(shell.currentIndex, ShellTabs.player);
+
+          // Pull down from the top of the screen: the reverse of the open, so
+          // the artwork should fly back down as the home tab returns.
+          await tester.dragFrom(
+            const Offset(180.0, 250.0),
+            const Offset(0, 240),
+          );
+          await tester.pump();
+          expect(ArtworkFlight.inFlight, isTrue);
+
+          await tester.pumpAndSettle();
+          expect(ArtworkFlight.inFlight, isFalse);
+          expect(shell.currentIndex, ShellTabs.home);
+
+          await tester.pump(const Duration(seconds: 16));
+        });
+      },
+    );
+
+    testWidgets(
+      'the player tab is left visible for the ways back that do not fly the '
+      'cover',
+      (tester) async {
+        await withSemantics(tester, () async {
+          artwork = FakeArtworkService(artwork: testArtworkPng);
+          await playFirstTrack(tester);
+
+          await tester.tap(miniPlayerTap());
+          await tester.pumpAndSettle();
+          expect(revealFade(tester).opacity.value, 1.0);
+
+          // Collapse from the top bar: the cover flies back down and the screen
+          // fades out on the way, which is the one moment it should be
+          // transparent.
+          await tester.tap(find.byTooltip('Collapse player'));
+          await tester.pumpAndSettle();
+          expect(shell.currentIndex, ShellTabs.home);
+
+          // Regression: the fade was left at zero after the collapse, and the
+          // navigation bar switches tabs without starting a flight to fade it
+          // back in -- so the player came up as a fully transparent screen, and
+          // only the mini player (which *does* start a reveal) could open it.
+          expect(
+            revealFade(tester).opacity.value,
+            1.0,
+            reason: 'the collapsed player must not be left faded out',
+          );
+
+          await tester.tap(navIcon(CupertinoIcons.music_note_2));
+          await tester.pumpAndSettle();
+          expect(shell.currentIndex, ShellTabs.player);
+          expect(revealFade(tester).opacity.value, 1.0);
+          expect(find.byTooltip('Collapse player'), findsOneWidget);
+        });
+      },
+    );
+
+    testWidgets('the controls fade out with the cover, not after it', (
+      tester,
+    ) async {
+      await withSemantics(tester, () async {
+        artwork = FakeArtworkService(artwork: testArtworkPng);
+        await playFirstTrack(tester);
+
+        await tester.tap(miniPlayerTap());
+        await tester.pumpAndSettle();
+        expect(revealFade(tester).opacity.value, 1.0);
+
+        await tester.tap(find.byTooltip('Collapse player'));
+        // A frame for the flight to be set up in, then half of the cover's
+        // travel: by now it is most of the way back down to the mini player.
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 180));
+
+        expect(ArtworkFlight.inFlight, isTrue);
+        // Regression: the chrome faded on a clock of its own, eased in reverse,
+        // which left the controls at ~0.97 opacity here -- fully drawn, while the
+        // cover they belong to had already shrunk away underneath them.
+        expect(
+          revealFade(tester).opacity.value,
+          lessThan(0.5),
+          reason: 'the controls should fade out as the cover shrinks',
+        );
+
+        await tester.pumpAndSettle();
+        expect(shell.currentIndex, ShellTabs.home);
+        await tester.pump(const Duration(seconds: 16));
+      });
+    });
+
+    testWidgets(
+      'the expanded cover is hidden while its own flight is in the air',
+      (tester) async {
+        await withSemantics(tester, () async {
+          artwork = FakeArtworkService(artwork: testArtworkPng);
+          await playFirstTrack(tester);
+
+          await tester.tap(miniPlayerTap());
+          // One frame for the tab switch, one with the overlay inserted.
+          await tester.pump();
+          await tester.pump();
+
+          expect(ArtworkFlight.inFlight, isTrue);
+
+          // The real cover is transparent, so the only cover on screen is the
+          // flying copy. Without this the destination would sit at full size
+          // behind the small cover growing toward it, and the flight would read
+          // as two covers rather than one.
+          final coverOpacity = find.ancestor(
+            of: find.byKey(ArtworkFlight.expandedArt),
+            matching: find.byWidgetPredicate((widget) => widget is Opacity),
+          );
+          bool hidden() => tester
+              .widgetList<Opacity>(coverOpacity)
+              .any((widget) => widget.opacity == 0.0);
+
+          expect(hidden(), isTrue);
+
+          // And it is back the moment the flight lands.
+          await tester.pumpAndSettle();
+          expect(hidden(), isFalse);
+
+          await tester.pump(const Duration(seconds: 16));
+        });
+      },
+    );
   });
 }

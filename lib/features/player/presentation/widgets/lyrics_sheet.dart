@@ -1,4 +1,5 @@
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:wavely/core/models/song_model.dart';
@@ -147,61 +148,94 @@ class _LyricsBody extends StatefulWidget {
 
 class _LyricsBodyState extends State<_LyricsBody> {
   final _scrollController = ScrollController();
-  Duration _lastPosition = Duration.zero;
+
+  /// The playhead stream this sheet follows, and the line it is highlighting.
+  ValueListenable<Duration>? _position;
+  int? _activeIndex;
 
   @override
-  void dispose() {
-    _scrollController.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final playerCtrl = context.read<PlayerController>();
+  void didChangeDependencies() {
+    super.didChangeDependencies();
 
     // Follows the playhead through the narrow position listenable rather than
     // through the controller's notifications, so the highlight moves without
     // dragging the whole sheet through a rebuild on every tick.
-    return ValueListenableBuilder<Duration>(
-      valueListenable: playerCtrl.positionListenable,
-      builder: (context, position, _) {
-        final lines = widget.result.lines;
+    final listenable = context.read<PlayerController>().positionListenable;
+    if (identical(_position, listenable)) return;
 
-        // Only react when the active line actually changed. The position stream
-        // fires several times a second and rebuilding every line each time would
-        // both flicker and fight the user's scrolling.
-        final activeIndex = _indexOfLineAt(lines, position);
-        if (position != _lastPosition) {
-          _lastPosition = position;
-          _scrollToActive(activeIndex);
-        }
+    _position?.removeListener(_onPosition);
+    _position = listenable;
+    _activeIndex = _indexOfLineAt(widget.result.lines, listenable.value);
+    listenable.addListener(_onPosition);
+  }
 
-        return ListView.builder(
-          controller: _scrollController,
-          padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 24.0),
-          itemCount: lines.length,
-          itemBuilder: (context, index) {
-            final isActive = index == activeIndex;
-            // Before the first timestamp nothing has been sung yet, so no line is
-            // "past" -- every one reads as upcoming.
-            final isPast = activeIndex != null && index < activeIndex;
+  @override
+  void didUpdateWidget(_LyricsBody oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // A different set of lines: re-point the highlight rather than leaving it on
+    // a line number that may not exist in the new sheet.
+    if (identical(oldWidget.result, widget.result)) return;
+    _activeIndex = _indexOfLineAt(
+      widget.result.lines,
+      _position?.value ?? Duration.zero,
+    );
+  }
 
-            return Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8.0),
-              child: Text(
-                lines[index].text,
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: isActive
-                      ? Colors.white
-                      : Colors.white.withValues(alpha: isPast ? 0.28 : 0.45),
-                  fontSize: isActive ? 18.0 : 16.0,
-                  fontWeight: isActive ? FontWeight.w700 : FontWeight.w400,
-                  height: 1.4,
-                ),
-              ),
-            );
-          },
+  @override
+  void dispose() {
+    _position?.removeListener(_onPosition);
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  /// Re-highlight only when the line under the playhead changes.
+  ///
+  /// The stream fires several times a second. Rebuilding every line on each of
+  /// those ticks was both wasteful -- hundreds of text layouts for a highlight
+  /// that moves once every few seconds -- and jittery. Nothing scrolls from
+  /// inside `build` either: moving the scroll view this list is built into is a
+  /// write to an ancestor mid-build, so the scroll is queued for the frame after
+  /// the new highlight has been laid out.
+  void _onPosition() {
+    final position = _position?.value;
+    if (position == null || !mounted) return;
+
+    final active = _indexOfLineAt(widget.result.lines, position);
+    if (active == _activeIndex) return;
+
+    setState(() => _activeIndex = active);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToActive());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final lines = widget.result.lines;
+    final activeIndex = _activeIndex;
+
+    return ListView.builder(
+      controller: _scrollController,
+      padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 24.0),
+      itemCount: lines.length,
+      itemBuilder: (context, index) {
+        final isActive = index == activeIndex;
+        // Before the first timestamp nothing has been sung yet, so no line is
+        // "past" -- every one reads as upcoming.
+        final isPast = activeIndex != null && index < activeIndex;
+
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8.0),
+          child: Text(
+            lines[index].text,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: isActive
+                  ? Colors.white
+                  : Colors.white.withValues(alpha: isPast ? 0.28 : 0.45),
+              fontSize: isActive ? 18.0 : 16.0,
+              fontWeight: isActive ? FontWeight.w700 : FontWeight.w400,
+              height: 1.4,
+            ),
+          ),
         );
       },
     );
@@ -224,7 +258,8 @@ class _LyricsBodyState extends State<_LyricsBody> {
   ///
   /// Only nudges when it has drifted well off screen, so the view does not
   /// fight a user who is reading ahead.
-  void _scrollToActive(int? activeIndex) {
+  void _scrollToActive() {
+    final activeIndex = _activeIndex;
     if (activeIndex == null || !_scrollController.hasClients) return;
 
     final viewport = _scrollController.position.viewportDimension;

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 
 import 'package:just_audio/just_audio.dart';
 
@@ -28,8 +29,20 @@ class AudioPlayerService implements AudioEngine {
   final AudioPlayer _player = AudioPlayer();
 
   List<WavelySong> _queue = const [];
+
+  /// [queue]'s read-only face, built once per loaded queue.
+  ///
+  /// Wrapping the list per read minted an object for every caller on every
+  /// build, and the queue is read by the shell, the mini player, the player and
+  /// the home list. A view over the same list rather than a copy, so the one
+  /// `updateSong` write is reflected without having to rebuild it.
+  List<WavelySong> _queueView = const [];
+
   Map<String, WavelySong> _byId = const {};
   WavelySong? _currentSong;
+
+  /// [_currentSong]'s position in [_queue], resolved when the track changes.
+  int _currentIndex = -1;
   String? _errorMessage;
 
   StreamSubscription<SequenceState?>? _sequenceSub;
@@ -41,7 +54,13 @@ class AudioPlayerService implements AudioEngine {
     // original order -- indexing _queue would then show the wrong song.
     _sequenceSub = _player.sequenceStateStream.listen((state) {
       final song = _songForTag(state?.currentSource?.tag);
-      if (song != null) _currentSong = song;
+      if (song == null || song.id == _currentSong?.id) return;
+
+      _currentSong = song;
+      // Looked up here, once per track change, rather than on every read of
+      // [currentIndex]: the queue can be thousands of tracks and its position is
+      // read several times per build of the player screens.
+      _currentIndex = _queue.indexWhere((candidate) => candidate.id == song.id);
     });
   }
 
@@ -54,7 +73,7 @@ class AudioPlayerService implements AudioEngine {
   AudioPlayer get player => _player;
 
   @override
-  List<WavelySong> get queue => List.unmodifiable(_queue);
+  List<WavelySong> get queue => _queueView;
   @override
   String? get errorMessage => _errorMessage;
 
@@ -63,10 +82,21 @@ class AudioPlayerService implements AudioEngine {
   WavelySong? get currentSong => _currentSong;
 
   /// Position of [currentSong] within [queue], or -1 when nothing is loaded.
+  ///
+  /// The cached offset is trusted only while it still points at the current
+  /// track, so a sequence change that somehow slipped past the listener falls
+  /// back to a search rather than reporting the wrong row as playing.
   @override
-  int get currentIndex => _currentSong == null
-      ? -1
-      : _queue.indexWhere((s) => s.id == _currentSong!.id);
+  int get currentIndex {
+    final song = _currentSong;
+    if (song == null) return -1;
+    if (_currentIndex >= 0 &&
+        _currentIndex < _queue.length &&
+        _queue[_currentIndex].id == song.id) {
+      return _currentIndex;
+    }
+    return _queue.indexWhere((candidate) => candidate.id == song.id);
+  }
 
   /// Whether just_audio currently knows of a following / preceding item.
   @override
@@ -102,16 +132,27 @@ class AudioPlayerService implements AudioEngine {
   @override
   Future<void> setQueue(List<WavelySong> songs, {int initialIndex = 0}) async {
     _queue = List<WavelySong>.from(songs);
+    _queueView = UnmodifiableListView(_queue);
     _byId = {for (final song in _queue) song.id: song};
     _errorMessage = null;
 
     if (_queue.isEmpty) {
       _currentSong = null;
+      _currentIndex = -1;
       await _player.stop();
       return;
     }
 
     final safeIndex = initialIndex.clamp(0, _queue.length - 1);
+
+    // Published before the engine is asked to open anything. The UI reads the
+    // current track and the queue from here, so seeding them this early is what
+    // lets a restored session be on screen while the source -- a file open, a
+    // decoder, a media-store query -- is still being prepared. Waiting for
+    // setAudioSource first left the player showing "Nothing playing" for as long
+    // as that took.
+    _currentSong = _queue[safeIndex];
+    _currentIndex = safeIndex;
 
     // Lazy preparation keeps a large library from being buffered up front and
     // means one unreadable file only breaks that track rather than the queue.
@@ -129,9 +170,11 @@ class AudioPlayerService implements AudioEngine {
       // setAudioSource does not emit a sequence state on every platform, so seed
       // the current track from the requested index rather than trusting it to.
       _currentSong = _queue[safeIndex];
+      _currentIndex = safeIndex;
     } on Exception catch (e) {
       _errorMessage = 'Could not open this track: $e';
       _currentSong = null;
+      _currentIndex = -1;
       await _player.stop();
     }
   }
@@ -191,6 +234,10 @@ class AudioPlayerService implements AudioEngine {
   @override
   Future<void> setVolume(double volume) =>
       _player.setVolume(volume.clamp(0.0, 1.0));
+
+  @override
+  Future<void> setSpeed(double speed) =>
+      _player.setSpeed(speed.clamp(0.5, 2.0));
 
   @override
   Future<void> setShuffle(bool enabled) =>

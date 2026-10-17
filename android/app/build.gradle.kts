@@ -6,7 +6,15 @@ plugins {
 
 android {
     namespace = "com.wavely.app.wavely"
-    compileSdk = flutter.compileSdkVersion
+    // Pinned rather than left at Flutter's default (36). Listening rooms talk
+    // over local-network sockets, and Android only enforces
+    // ACCESS_LOCAL_NETWORK -- the one network permission that is asked for at
+    // runtime -- for apps targeting API 37. On a lower target the platform
+    // grants local-network access implicitly through INTERNET and never shows
+    // the prompt, which is why the app never asked for it. Compiling against 37
+    // is what makes the permission name and its runtime request available at
+    // all; `permission_handler_android` already requires the same SDK.
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -20,7 +28,7 @@ android {
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+        targetSdk = 37
         // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION
         // is added automatically by Flutter. (https://developer.android.com/studio/build/configure-apk-splits#configure-APK-versions)
         // You can force using the value of versionCode by specifying the `-P force-version-code-ignoring-abi=true`

@@ -12,13 +12,17 @@ import 'package:wavely/core/theme/ios27_glass_theme.dart';
 import 'package:wavely/core/widgets/ambient_background.dart';
 import 'package:wavely/core/widgets/artwork_image.dart';
 import 'package:wavely/core/widgets/glass_button.dart';
+import 'package:wavely/core/widgets/glass_container.dart';
 import 'package:wavely/core/widgets/glass_slider.dart';
+import 'package:wavely/features/player/presentation/widgets/artwork_flight.dart';
 import 'package:wavely/core/widgets/name_prompt_dialog.dart';
 import 'package:wavely/core/utils/formatters.dart';
 import 'package:wavely/features/library/controllers/library_controller.dart';
 import 'package:wavely/features/navigation/controllers/shell_controller.dart';
 import 'package:wavely/features/player/controllers/player_controller.dart';
 import 'package:wavely/features/player/presentation/widgets/lyrics_sheet.dart';
+import 'package:wavely/features/room/controllers/room_controller.dart';
+import 'package:wavely/features/room/presentation/room_sheet.dart';
 
 /// The expanded player: the second tab of the shell.
 ///
@@ -45,18 +49,120 @@ class NowPlayingExpandedScreen extends StatelessWidget {
 
     return Scaffold(
       backgroundColor: Colors.black,
-      body: song == null
-          ? AmbientBackground(
-              color: fallback,
-              washPrimary: null,
-              washSecondary: null,
-              child: const SafeArea(child: _NothingPlaying()),
-            )
-          : _ArtworkBackdrop(
-              song: song,
-              fallback: fallback,
-              child: const SafeArea(child: _Player()),
-            ),
+      // Revealed *with* the cover, not after it: the mini player's artwork sets
+      // off toward this screen's own cover and this content fades up from the
+      // black scaffold at the same instant, so the backdrop and controls come
+      // into view as the artwork expands.
+      body: _RevealOnOpen(
+        child: song == null
+            ? AmbientBackground(
+                color: fallback,
+                washPrimary: null,
+                washSecondary: null,
+                child: const SafeArea(child: _NothingPlaying()),
+              )
+            : _ArtworkBackdrop(
+                song: song,
+                fallback: fallback,
+                child: const SafeArea(child: _Player()),
+              ),
+      ),
+    );
+  }
+}
+
+/// Fades the expanded player in as a cover flight sets off toward it, and out
+/// as the cover flies back to the mini player.
+///
+/// Sits at full opacity by default, so reaching this tab any other way (the
+/// navigation bar, the restored session) shows the player immediately.
+///
+/// The fade is not an animation of its own: it is the cover's own travel read
+/// backwards, frame by frame, off [ArtworkFlight.progress]. That is deliberate.
+/// Running a second animation on the same duration is only ever an approximation
+/// of the flight, and with this curve it is not even a good one -- the curve is a
+/// hard ease-out, so reversing an eased controller to fade out evaluates it at
+/// `1 - t`, which sits at ~98% opacity for the first four fifths of a collapse.
+/// The cover had already shrunk all the way to the mini player while the controls
+/// were still fully drawn; only in the last few frames did they disappear. Read
+/// off the flight, a cover 80% of the way down means the controls are 80% gone.
+///
+/// A single [FadeTransition] is deliberate: opacity is composited on one layer,
+/// so the fade costs no relayout and stops the instant it reaches full.
+class _RevealOnOpen extends StatefulWidget {
+  final Widget child;
+
+  const _RevealOnOpen({required this.child});
+
+  @override
+  State<_RevealOnOpen> createState() => _RevealOnOpenState();
+}
+
+class _RevealOnOpenState extends State<_RevealOnOpen>
+    with SingleTickerProviderStateMixin {
+  /// The chrome's visibility, 0 (gone) to 1 (fully on screen).
+  ///
+  /// A controller used purely as a value holder -- it is never run, only set
+  /// from the flight -- so the fade can stay a [FadeTransition], which composites
+  /// on one layer, instead of a rebuild of the subtree per frame.
+  late final AnimationController _visibility = AnimationController(
+    vsync: this,
+    value: 1.0,
+  );
+
+  /// The same value, eased into the slight scale the screen opens with.
+  late final Animation<double> _scale = Tween<double>(
+    begin: 0.95,
+    end: 1.0,
+  ).animate(_visibility);
+
+  @override
+  void initState() {
+    super.initState();
+    ArtworkFlight.progress.addListener(_syncToFlight);
+    ArtworkFlight.inFlightNotifier.addListener(_syncToFlight);
+    ArtworkFlight.isCollapsing.addListener(_syncToFlight);
+  }
+
+  /// Point the chrome at wherever the cover is.
+  ///
+  /// Called on every frame of a flight, and on the two edges: the moment one
+  /// starts, and the moment it lands. At rest -- no flight, or one that ended --
+  /// the screen is fully visible, which is what the navigation bar and a restored
+  /// session need, since neither starts a flight to fade it back in.
+  void _syncToFlight() {
+    if (!mounted) return;
+
+    if (!ArtworkFlight.inFlightNotifier.value) {
+      _visibility.value = 1.0;
+      return;
+    }
+
+    final travelled = ArtworkFlight.motionCurve.transform(
+      ArtworkFlight.progress.value.clamp(0.0, 1.0),
+    );
+    // Growing: the chrome arrives with the cover. Shrinking: it leaves with it,
+    // at the same rate, so the two read as one motion rather than as artwork
+    // that moves away under controls that stay put.
+    _visibility.value = ArtworkFlight.isCollapsing.value
+        ? 1.0 - travelled
+        : travelled;
+  }
+
+  @override
+  void dispose() {
+    ArtworkFlight.progress.removeListener(_syncToFlight);
+    ArtworkFlight.inFlightNotifier.removeListener(_syncToFlight);
+    ArtworkFlight.isCollapsing.removeListener(_syncToFlight);
+    _visibility.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ScaleTransition(
+      scale: _scale,
+      child: FadeTransition(opacity: _visibility, child: widget.child),
     );
   }
 }
@@ -83,7 +189,11 @@ class _ArtworkBackdrop extends StatefulWidget {
 }
 
 class _ArtworkBackdropState extends State<_ArtworkBackdrop> {
-  Future<Uint8List?>? _future;
+  /// The cover bytes to blur, once they are known.
+  Uint8List? _bytes;
+
+  /// The track the current answer belongs to, so a late reply for an
+  /// abandoned track is dropped rather than blurring the wrong cover.
   String? _songId;
 
   @override
@@ -99,83 +209,90 @@ class _ArtworkBackdropState extends State<_ArtworkBackdrop> {
   }
 
   void _refreshIfNeeded() {
-    // Cached per track: building a new future inside `build` refires the
-    // lookup (and its setState) on every parent rebuild, which is a fetch
-    // loop that keeps this whole screen rebuilding.
+    // Cached per track: re-resolving inside `build` refires the lookup (and
+    // its setState) on every parent rebuild, which is a fetch loop that keeps
+    // this whole screen rebuilding.
     if (_songId == widget.song.id) return;
     _songId = widget.song.id;
-    // The service caches per album, so revisits resolve without re-querying
-    // the media store.
-    _future = ArtworkScope.of(context).artworkFor(widget.song);
+
+    // The service caches per album, so a revisit resolves without touching the
+    // media store -- and it is read *synchronously* here rather than through a
+    // future, because even a cache hit still costs a microtask that way and
+    // the backdrop dropped to its flat tint for a frame on every track change.
+    // The palette extraction already pulls the album's cover, so on the path
+    // that matters this is a hit.
+    final service = ArtworkScope.of(context);
+    if (service.isCached(widget.song)) {
+      _bytes = service.cachedArtworkFor(widget.song);
+      return;
+    }
+
+    _bytes = null;
+    service.artworkFor(widget.song).then((bytes) {
+      if (!mounted || _songId != widget.song.id) return;
+      setState(() => _bytes = bytes);
+    });
   }
 
   @override
   Widget build(BuildContext context) {
+    final bytes = _bytes;
+    if (bytes == null) {
+      // Still loading, or the device has no cover: the flat tint keeps the
+      // screen from flashing black in the meantime.
+      return AmbientBackground(
+        color: widget.fallback,
+        washPrimary: null,
+        washSecondary: null,
+        child: widget.child,
+      );
+    }
+
     return ColoredBox(
       color: const Color(0xFF05060B),
-      child: FutureBuilder<Uint8List?>(
-        future: _future,
-        builder: (context, snapshot) {
-          final bytes = snapshot.data;
-          if (bytes == null) {
-            // Still loading, or the device has no cover: the flat tint keeps
-            // the screen from flashing black in the meantime.
-            return AmbientBackground(
-              color: widget.fallback,
-              washPrimary: null,
-              washSecondary: null,
-              child: widget.child,
-            );
-          }
-
-          return Stack(
-            fit: StackFit.expand,
-            children: [
-              // Decoded tiny and scaled up: a 64px cover stretched full-screen
-              // and blurred looks identical to a blurred 512px one, for a
-              // fraction of the decode memory and GPU blur cost. Scaled past
-              // the edges so the blur has no visible rim, repaint-isolated so
-              // it only rebuilds on track change, never with the playhead.
-              RepaintBoundary(
-                child: ImageFiltered(
-                  imageFilter: ui.ImageFilter.blur(
-                    sigmaX: 40.0,
-                    sigmaY: 40.0,
-                  ),
-                  child: Transform.scale(
-                    scale: 1.35,
-                    child: Image.memory(
-                      bytes,
-                      cacheWidth: 64,
-                      filterQuality: FilterQuality.low,
-                      fit: BoxFit.cover,
-                      gaplessPlayback: true,
-                    ),
-                  ),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          // Decoded tiny and scaled up: a 64px cover stretched full-screen and
+          // blurred looks identical to a blurred 512px one, for a fraction of
+          // the decode memory and GPU blur cost. Scaled past the edges so the
+          // blur has no visible rim, repaint-isolated so it only rebuilds on
+          // track change, never with the playhead.
+          RepaintBoundary(
+            child: ImageFiltered(
+              imageFilter: ui.ImageFilter.blur(sigmaX: 40.0, sigmaY: 40.0),
+              child: Transform.scale(
+                scale: 1.35,
+                child: Image.memory(
+                  bytes,
+                  cacheWidth: 64,
+                  filterQuality: FilterQuality.low,
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true,
                 ),
               ),
-              // Bright legibility scrim: just enough black for white text
-              // to read, lighter in the middle where the cover sits so the
-              // artwork hues stay vivid Apple-Music style.
-              const DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [
-                      Color(0x7A000000),
-                      Color(0x33000000),
-                      Color(0x33000000),
-                      Color(0x99000000),
-                    ],
-                    stops: [0.0, 0.35, 0.62, 1.0],
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                  ),
-                ),
+            ),
+          ),
+          // Bright legibility scrim: just enough black for white text to read,
+          // lighter in the middle where the cover sits so the artwork hues stay
+          // vivid Apple-Music style.
+          const DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [
+                  Color(0x7A000000),
+                  Color(0x33000000),
+                  Color(0x33000000),
+                  Color(0x99000000),
+                ],
+                stops: [0.0, 0.35, 0.62, 1.0],
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
               ),
-              widget.child,
-            ],
-          );
-        },
+            ),
+          ),
+          widget.child,
+        ],
       ),
     );
   }
@@ -188,8 +305,10 @@ class _Player extends StatelessWidget {
   Widget build(BuildContext context) {
     final playerCtrl = context.watch<PlayerController>();
     final song = playerCtrl.currentSong!;
-
     final duration = playerCtrl.duration;
+
+    final isActive =
+        context.watch<ShellController>().currentIndex == kPlayerTabIndex;
 
     // One seamless scroll: cover, title, completion line, transport,
     // volume/actions, then Up Next below the players. The transport used to
@@ -202,36 +321,153 @@ class _Player extends StatelessWidget {
       child: Column(
         children: [
           _TopBar(song: song),
+          const _RoomBanner(),
           Expanded(
-            child: SingleChildScrollView(
-              child: Column(
-                children: [
-                  const SizedBox(height: 8.0),
-                  _AlbumArt(song: song),
-                  const SizedBox(height: 28.0),
-                  _TrackHeading(song: song),
-                  const SizedBox(height: 20.0),
-                  // Only the seek bar and the time labels move with the
-                  // playhead, so only they listen to the position ticks -- the
-                  // rest of this column used to rebuild several times a
-                  // second for a number that moves once a second.
-                  _SeekSection(playerCtrl: playerCtrl, duration: duration),
-                  const SizedBox(height: 16.0),
-                  _TransportControls(),
-                  _BottomActions(song: song),
-                  const SizedBox(height: 28.0),
-                  // What plays after this one, below the players instead of
-                  // wedged between the progress line and the transport.
-                  const _UpNext(),
-                  // Clearance for the docked navigation bar below (the
-                  // SafeArea above already clears the gesture bar itself).
-                  const SizedBox(height: 76.0),
-                ],
+            child: _CollapseOnPullDown(
+              song: song,
+              child: SingleChildScrollView(
+                physics: isActive
+                    ? const BouncingScrollPhysics(
+                        parent: AlwaysScrollableScrollPhysics(),
+                      )
+                    : const NeverScrollableScrollPhysics(),
+                child: Column(
+                  children: [
+                    const SizedBox(height: 8.0),
+                    _AlbumArt(song: song),
+                    const SizedBox(height: 28.0),
+                    _TrackHeading(song: song),
+                    const SizedBox(height: 20.0),
+                    // Only the seek bar and the time labels move with the
+                    // playhead, so only they listen to the position ticks -- the
+                    // rest of this column used to rebuild several times a
+                    // second for a number that moves once a second.
+                    _SeekSection(playerCtrl: playerCtrl, duration: duration),
+                    const SizedBox(height: 16.0),
+                    _TransportControls(),
+                    _BottomActions(song: song),
+                    const SizedBox(height: 28.0),
+                    // What plays after this one, below the players instead of
+                    // wedged between the progress line and the transport.
+                    const _UpNext(),
+                    // Clearance for the floating navigation capsule below (the
+                    // SafeArea above already clears the gesture bar itself). The
+                    // mini player is hidden on this tab, so only the capsule has
+                    // to be cleared.
+                    const SizedBox(height: 112.0),
+                  ],
+                ),
               ),
             ),
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Sends the playing cover back down into the mini player and opens the home
+/// tab underneath it.
+///
+/// Shared by the collapse control and the pull-down gesture, so both reverse
+/// the open the same way: the artwork shrinks to the mini player's remembered
+/// rect while the shell leaves the player tab.
+void _collapseToMini(BuildContext context, WavelySong song) {
+  final shell = context.read<ShellController>();
+  ArtworkFlight.collapse(
+    context,
+    song: song,
+    onComplete: () => shell.selectTab(0),
+  );
+}
+
+/// How far the screen has to be pulled down from its top edge before the player
+/// collapses back to the mini player.
+///
+/// Long enough that it cannot fire off the small overscroll a genuine scroll
+/// gesture produces at the top, short enough that a deliberate downward flick
+/// gets there without feeling like a fight.
+const double _collapsePullThreshold = 72.0;
+
+/// Pulling the expanded player down from its top edge collapses it.
+///
+/// The exact reverse of the open: the cover flies back down into the mini player
+/// ([ArtworkFlight.collapse]) while the shell switches to the home tab, so the
+/// two motions mirror each other.
+///
+/// This wraps the scrollable rather than competing with it, which is what keeps
+/// ordinary scrolling intact: the pull is only read once the list is already at
+/// its top, so a drag that is really scrolling the queue back up can never
+/// double as a collapse.
+class _CollapseOnPullDown extends StatefulWidget {
+  final WavelySong song;
+  final Widget child;
+
+  const _CollapseOnPullDown({required this.song, required this.child});
+
+  @override
+  State<_CollapseOnPullDown> createState() => _CollapseOnPullDownState();
+}
+
+class _CollapseOnPullDownState extends State<_CollapseOnPullDown> {
+  /// How far the current gesture has pulled the screen past its top edge.
+  double _pull = 0.0;
+
+  /// Set for the rest of a gesture once the pull has fired, so one drag can
+  /// only collapse the screen once.
+  bool _fired = false;
+
+  bool _onScroll(ScrollNotification notification) {
+    final shell = context.read<ShellController>();
+    if (shell.currentIndex != kPlayerTabIndex) return false;
+
+    // Only the outer scroll view drives the pull; a nested one inside a row
+    // must not.
+    if (notification.depth != 0) return false;
+
+    if (notification is ScrollStartNotification) {
+      _pull = 0.0;
+      _fired = false;
+      return false;
+    }
+    if (notification is ScrollEndNotification) {
+      _pull = 0.0;
+      return false;
+    }
+    if (_fired) return false;
+
+    final metrics = notification.metrics;
+    // The pull only counts once the list is already at its top, so a drag that
+    // first scrolls the queue back up never doubles as a collapse.
+    if (metrics.pixels > metrics.minScrollExtent) return false;
+
+    if (notification is OverscrollNotification) {
+      // Clamping physics: dragging down past the top reports the distance as a
+      // negative overscroll.
+      if (notification.overscroll < 0) _add(-notification.overscroll);
+    } else if (notification is ScrollUpdateNotification &&
+        metrics.pixels < metrics.minScrollExtent) {
+      // Bouncing physics: the pixels actually travel past the top instead, so
+      // the pull is read off the downward delta.
+      final delta = notification.scrollDelta ?? 0.0;
+      if (delta < 0) _add(-delta);
+    }
+
+    return false;
+  }
+
+  void _add(double amount) {
+    _pull += amount;
+    if (_pull < _collapsePullThreshold) return;
+    _fired = true;
+    _collapseToMini(context, widget.song);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return NotificationListener<ScrollNotification>(
+      onNotification: _onScroll,
+      child: widget.child,
     );
   }
 }
@@ -279,13 +515,13 @@ class _SeekSectionState extends State<_SeekSection> {
           children: [
             GlassSlider(
               value: fraction,
+              onChangeStart: (value) => setState(() => _dragValue = value),
               onChanged: (value) => setState(() => _dragValue = value),
               onChangeEnd: (value) {
-                widget.playerCtrl.seek(
-                  Duration(
-                    milliseconds: (duration.inMilliseconds * value).round(),
-                  ),
+                final targetPos = Duration(
+                  milliseconds: (duration.inMilliseconds * value).round(),
                 );
+                widget.playerCtrl.seek(targetPos);
                 setState(() => _dragValue = null);
               },
             ),
@@ -336,9 +572,18 @@ class _UpNext extends StatelessWidget {
     final queue = playerCtrl.queue;
     final currentIndex = playerCtrl.currentIndex;
 
-    final upcoming = <int>[
-      for (var i = currentIndex + 1; i < queue.length; i++) i,
-    ];
+    // Counted, and only the preview walked. Building the list of every index
+    // after the current one allocated a few thousand ints on every rebuild of
+    // this screen -- on every play, pause and track change -- to end up drawing
+    // at most twenty rows.
+    final firstUpcoming = currentIndex < 0 ? 0 : currentIndex + 1;
+    final upcomingCount = (queue.length - firstUpcoming).clamp(
+      0,
+      queue.length,
+    );
+    final previewCount = upcomingCount < _upNextPreviewLimit
+        ? upcomingCount
+        : _upNextPreviewLimit;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -357,9 +602,9 @@ class _UpNext extends StatelessWidget {
               ),
             ),
             Text(
-              upcoming.isEmpty
+              upcomingCount == 0
                   ? 'End of queue'
-                  : '${upcoming.length} ${upcoming.length == 1 ? 'track' : 'tracks'}',
+                  : '$upcomingCount ${upcomingCount == 1 ? 'track' : 'tracks'}',
               style: TextStyle(
                 fontSize: 12.0,
                 color: Colors.white.withValues(alpha: 0.5),
@@ -368,7 +613,7 @@ class _UpNext extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 6.0),
-        if (upcoming.isEmpty)
+        if (upcomingCount == 0)
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 16.0),
             child: Text(
@@ -380,16 +625,20 @@ class _UpNext extends StatelessWidget {
             ),
           )
         else ...[
-          for (final index in upcoming.take(_upNextPreviewLimit))
+          for (
+            var index = firstUpcoming;
+            index < firstUpcoming + previewCount;
+            index++
+          )
             _UpNextRow(
               song: queue[index],
               onTap: () => playerCtrl.playIndex(index),
             ),
-          if (upcoming.length > _upNextPreviewLimit)
+          if (upcomingCount > _upNextPreviewLimit)
             Padding(
               padding: const EdgeInsets.symmetric(vertical: 10.0),
               child: Text(
-                'See all ${upcoming.length} on the Home tab.',
+                'See all $upcomingCount on the Home tab.',
                 style: TextStyle(
                   color: Colors.white.withValues(alpha: 0.5),
                   fontSize: 13.0,
@@ -486,8 +735,9 @@ class _TopBar extends StatelessWidget {
           ),
           tooltip: 'Collapse player',
           // The player is a tab, so "back" means going to the home tab rather
-          // than popping a route that was never pushed.
-          onPressed: () => context.read<ShellController>().selectTab(0),
+          // than popping a route that was never pushed. The cover flies back
+          // to the mini player as the tab switches underneath it.
+          onPressed: () => _collapseToMini(context, song),
         ),
         Expanded(
           child: Column(
@@ -514,8 +764,85 @@ class _TopBar extends StatelessWidget {
             ],
           ),
         ),
+        // The room lives beside the overflow menu rather than in the bottom
+        // action row: that row is already three controls and a volume slider
+        // wide, and a fourth icon comes out of the slider's width.
+        _RoomButton(),
         _TrackMenu(song: song),
       ],
+    );
+  }
+}
+
+/// Opens the listening-room sheet.
+class _RoomButton extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    // Selected rather than watched: this is a boolean that changes twice per
+    // room, and watching the controller would rebuild the button every time a
+    // guest's clock reply came in.
+    final inRoom = context.select<RoomController, bool>((room) => room.isActive);
+
+    return IconButton(
+      icon: Icon(
+        inRoom ? CupertinoIcons.person_2_fill : CupertinoIcons.person_2,
+        color: inRoom ? IOS27Colors.electricIndigoBright : Colors.white,
+        size: 24.0,
+      ),
+      tooltip: inRoom ? 'Listening room' : 'Listen together',
+      onPressed: () => RoomSheet.show(context),
+    );
+  }
+}
+
+/// A strip under the top bar while a room is up.
+///
+/// Not decoration: a guest's transport controls are inert by design -- the host
+/// is the only writer -- and controls that do nothing with no explanation read
+/// as the app being broken. The strip says who is driving and opens the room.
+class _RoomBanner extends StatelessWidget {
+  const _RoomBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    final room = context.watch<RoomController>();
+    if (!room.isActive) return const SizedBox.shrink();
+
+    final text = room.isHost
+        ? 'Room ${room.roomCode}  ·  ${room.members.length} listening'
+        : 'Following ${room.hostName ?? 'the host'}';
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 4.0),
+      child: GlassContainer(
+        padding: const EdgeInsets.symmetric(horizontal: 14.0, vertical: 7.0),
+        borderRadius: IOS27GlassTheme.radiusPill,
+        onTap: () => RoomSheet.show(context),
+        semanticLabel: 'Listening room: $text',
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              CupertinoIcons.person_2_fill,
+              size: 14.0,
+              color: IOS27Colors.electricIndigoBright,
+            ),
+            const SizedBox(width: 8.0),
+            Flexible(
+              child: Text(
+                text,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12.0,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -529,40 +856,40 @@ class _AlbumArt extends StatelessWidget {
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size.width * 0.78;
 
-    return Hero(
-      tag: 'album_art_${song.id}',
-      // No shadow container at all: the previous BoxShadow (black 45%,
-      // blur 40, offset down 18) painted a solid rounded-rect slab behind
-      // the cover, and its downward offset is exactly the shade box hanging
-      // below the artwork in the screenshot. The blurred backdrop already
-      // gives depth, so the cover sits directly on it with no slab behind.
-      child: RepaintBoundary(
-        // Expand transition on every new song: the incoming cover grows from
-        // 88% with a fade, so tapping a track visibly blooms into the full
-        // player size instead of snapping. Keyed by track, one-shot per
-        // change, settled otherwise.
-        child: AnimatedSwitcher(
-          duration: const Duration(milliseconds: 380),
-          switchInCurve: Curves.easeOutCubic,
-          switchOutCurve: Curves.easeIn,
-          layoutBuilder: (currentChild, previousChildren) => Stack(
-            alignment: Alignment.center,
-            children: [...previousChildren, ?currentChild],
-          ),
-          transitionBuilder: (child, animation) => FadeTransition(
-            opacity: animation,
-            child: ScaleTransition(
-              scale: Tween<double>(begin: 0.88, end: 1.0).animate(animation),
-              child: child,
-            ),
-          ),
-          child: KeyedSubtree(
-            key: ValueKey('cover_${song.id}'),
+    // The flight target: this is the rect the mini player's cover grows
+    // into when the expanded player opens. The key is shared with the
+    // mini player through [ArtworkFlight] so neither side knows the other's
+    // widget tree.
+    //
+    // Deliberately *not* re-keyed per track. A keyed swap throws away the
+    // cover widget's state, and with it the bytes it is already holding, so
+    // every track change reopened on the placeholder before the new cover
+    // arrived. Keeping one widget means the old cover stays up and dissolves
+    // into the new one ([ArtworkImage] owns that cross-fade) -- the way the
+    // Apple Music and Poweramp players behave.
+    return ValueListenableBuilder<bool>(
+      valueListenable: ArtworkFlight.inFlightNotifier,
+      builder: (context, inFlight, child) => Opacity(
+        // Hidden but never removed while a cover is flying: the box must stay
+        // laid out for the flight to aim at, and the flying copy supplies the
+        // pixels in its place. The cut back is deliberate rather than a fade --
+        // the overlay is dropped on the frame the travel ends, and the real
+        // cover takes over on that exact rect with the same pixels, so there is
+        // nothing to cross-fade.
+        opacity: inFlight ? 0.0 : 1.0,
+        child: child,
+      ),
+      child: KeyedSubtree(
+        key: ArtworkFlight.expandedArt,
+        child: Hero(
+          tag: 'album_art_${song.id}',
+          // No shadow container: the blurred backdrop already gives depth, so
+          // the cover sits directly on it with no slab behind.
+          child: RepaintBoundary(
             child: ArtworkImage(
               song: song,
               size: size,
-              borderRadius:
-                  BorderRadius.circular(IOS27GlassTheme.radiusLarge),
+              borderRadius: BorderRadius.circular(IOS27GlassTheme.radiusLarge),
               placeholder: const Center(
                 child: Icon(
                   CupertinoIcons.music_note_2,

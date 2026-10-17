@@ -6,6 +6,7 @@ import '../../../core/models/song_model.dart';
 import '../../../core/models/album_model.dart';
 import '../../../core/models/artist_model.dart';
 import '../../../core/models/playlist_model.dart';
+import '../../../core/services/library_filter_store.dart';
 import '../../../core/services/local_media_service.dart';
 
 enum LibraryTab { songs, albums, artists, playlists }
@@ -21,18 +22,45 @@ typedef LibraryLoadedCallback = Future<void> Function(List<WavelySong> songs);
 class LibraryController extends ChangeNotifier {
   final LocalMediaService _mediaService;
 
-  /// [mediaService] is injectable so tests can supply a stub instead of hitting
-  /// the platform media channels.
-  LibraryController({LocalMediaService? mediaService})
-    : _mediaService = mediaService ?? LocalMediaService() {
+  /// Where the user's folder / duration exclusions are read from and written to.
+  final LibraryFilterStore _filterStore;
+
+  /// [mediaService] and [filterStore] are injectable so tests can supply stubs
+  /// instead of hitting the platform media channels or the filesystem.
+  LibraryController({
+    LocalMediaService? mediaService,
+    LibraryFilterStore? filterStore,
+  }) : _mediaService = mediaService ?? LocalMediaService(),
+       _filterStore = filterStore ?? FileLibraryFilterStore() {
     // Showing a runtime permission dialog requires a foreground Activity, which
     // does not exist yet while main() is still assembling the provider tree.
     // Requesting this early makes permission_handler throw
     // PlatformException("Unable to detect current Android Activity"), which the
     // old catch-all silently turned into a demo library. Deferring to the first
     // frame gives the plugin an Activity to attach to.
-    WidgetsBinding.instance.addPostFrameCallback((_) => loadLibrary());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _init());
   }
+
+  /// Scan, then apply the saved exclusions.
+  ///
+  /// The scan runs first on purpose: reading preferences can be slow, or on a
+  /// platform with no store at all it can never answer, and a library that waits
+  /// on it would sit empty behind its own loading state. The exclusions land a
+  /// moment later and rebuild the (already shown) library.
+  Future<void> _init() async {
+    await loadLibrary();
+    await _loadFilterSettings();
+  }
+
+  /// Set once [dispose] has run, so a preference read that answers after the
+  /// controller is gone cannot notify a dead notifier.
+  bool _disposed = false;
+
+  /// Every song the media store returned, before the user's exclusions.
+  ///
+  /// Kept so the exclusion rules can be re-applied -- and the folder picker can
+  /// list folders whose songs are hidden -- without a fresh scan.
+  List<WavelySong> _scannedSongs = [];
 
   List<WavelySong> _allSongs = [];
   List<WavelySong> _filteredSongs = [];
@@ -50,6 +78,32 @@ class LibraryController extends ChangeNotifier {
   /// [_allSongs] keyed by id, for the lookups that resolve ids to songs
   /// (playlists, play history). Rebuilt only when [_allSongs] changes.
   Map<String, WavelySong> _songsById = const {};
+
+  /// Read-only view of [_allSongs].
+  ///
+  /// Held rather than minted per read: `allSongs` is read on every build of
+  /// several screens, and wrapping the list each time allocated a new object per
+  /// read -- which also defeated [totalDurationOf]'s cache, since the list it was
+  /// handed was never the same instance twice.
+  List<WavelySong> _allSongsView = const [];
+
+  /// One pre-lowercased haystack per song, aligned with [_allSongs].
+  ///
+  /// Search used to lowercase four fields per song on every keystroke. On a
+  /// library of thousands of tracks that is the whole cost of typing, so the
+  /// lowercasing is paid once per scan and each keystroke only runs `contains`
+  /// over strings that are already folded.
+  List<String> _searchHaystacks = const [];
+
+  /// Folder paths whose songs the user has chosen to hide.
+  final Set<String> _excludedFolders = {};
+
+  /// Tracks shorter than this are hidden. [Duration.zero] keeps everything.
+  Duration _minimumDuration = Duration.zero;
+
+  /// Distinct folders across the scan, with their song counts. Rebuilt only
+  /// when [_scannedSongs] changes.
+  Map<String, int>? _folderCountsCache;
 
   /// Playlists the user created, kept across reloads.
   ///
@@ -129,7 +183,18 @@ class LibraryController extends ChangeNotifier {
   /// read path never rebuilds them.
   void _invalidateSongDerivedCaches() {
     _genresCache = null;
+    _allSongsView = List.unmodifiable(_allSongs);
+    // The cached runtime belongs to the previous list, which no longer exists.
+    _runtimeFor = null;
     _songsById = {for (final song in _allSongs) song.id: song};
+    _searchHaystacks = [
+      for (final song in _allSongs)
+        // A NUL joins the fields: it cannot be typed, so a query can never be
+        // matched across two fields the way a space or a comma could.
+        '${song.title}\u0000${song.artist}\u0000${song.album}\u0000'
+            '${song.genre ?? ''}'
+            .toLowerCase(),
+    ];
   }
 
   Future<void> loadLibrary() => _loadLibrary(attempt: 1);
@@ -159,20 +224,14 @@ class LibraryController extends ChangeNotifier {
     // Copied rather than adopted: favourite toggles write back into this list,
     // and a const or otherwise unmodifiable list from the service would make
     // every heart throw.
-    _allSongs = List.of(result.songs);
-    _invalidateSongDerivedCaches();
-    _albums = _mediaService.extractAlbums(_allSongs);
-    _artists = _mediaService.extractArtists(_allSongs);
+    _scannedSongs = List.of(result.songs);
+    // The folder list is derived from the scan, so it is rebuilt with it.
+    _folderCountsCache = null;
 
-    // Generated from the genres that are really on the device, so the list is
-    // never empty just because the library loaded. User playlists are carried
-    // over instead of being rebuilt, or a rescan would delete them.
-    _playlists = [
-      ..._mediaService.extractGenrePlaylists(_allSongs),
-      ..._userPlaylists,
-    ];
+    // Everything the UI reads hangs off the exclusion-filtered list, so this is
+    // the one place a folder/duration rule is applied.
+    _rebuildFromScan();
 
-    _applyFilter();
     _isLoading = false;
     notifyListeners();
 
@@ -227,19 +286,146 @@ class LibraryController extends ChangeNotifier {
     final genre = _selectedGenre;
 
     if (query.isEmpty && genre == null) {
-      _filteredSongs = List.from(_allSongs);
+      _filteredSongs = List.of(_allSongs);
       return;
     }
 
-    _filteredSongs = _allSongs.where((song) {
-      if (genre != null && song.genre != genre) return false;
-      if (query.isEmpty) return true;
+    // Indexed rather than `where`: the haystacks are aligned with [_allSongs],
+    // so this reads one already-folded string per song instead of folding four
+    // fields per song on every keystroke.
+    final result = <WavelySong>[];
+    for (var i = 0; i < _allSongs.length; i++) {
+      final song = _allSongs[i];
+      if (genre != null && song.genre != genre) continue;
+      if (query.isNotEmpty && !_searchHaystacks[i].contains(query)) continue;
+      result.add(song);
+    }
+    _filteredSongs = result;
+  }
 
-      return song.title.toLowerCase().contains(query) ||
-          song.artist.toLowerCase().contains(query) ||
-          song.album.toLowerCase().contains(query) ||
-          (song.genre?.toLowerCase().contains(query) ?? false);
-    }).toList();
+  // ---------------------------------------------------------------------
+  // Library exclusions (Settings)
+  // ---------------------------------------------------------------------
+
+  /// Whether any folder or duration rule is currently hiding tracks.
+  bool get hasLibraryFilters =>
+      _excludedFolders.isNotEmpty || _minimumDuration > Duration.zero;
+
+  /// The shortest a track may be before it is hidden.
+  Duration get minimumDuration => _minimumDuration;
+
+  /// Folder paths the user has chosen to hide.
+  Set<String> get excludedFolders => Set.unmodifiable(_excludedFolders);
+
+  /// Whether [folder] is currently excluded.
+  bool isFolderExcluded(String folder) => _excludedFolders.contains(folder);
+
+  /// How many scanned tracks are hidden by the current rules.
+  int get excludedSongCount =>
+      _scannedSongs.length - _allSongs.length;
+
+  /// The folders the scan found, each with its track count.
+  ///
+  /// Computed from the *scanned* list, so a folder whose songs are all hidden
+  /// still appears here and can be switched back on.
+  Map<String, int> get folderSongCounts =>
+      _folderCountsCache ??= _computeFolderCounts();
+
+  Map<String, int> _computeFolderCounts() {
+    final counts = <String, int>{};
+    for (final song in _scannedSongs) {
+      final folder = folderOfSong(song);
+      if (folder == null) continue;
+      counts[folder] = (counts[folder] ?? 0) + 1;
+    }
+    return counts;
+  }
+
+  /// The folder paths the scan found, sorted for a stable settings list.
+  List<String> get folderOptions {
+    final folders = folderSongCounts.keys.toList()..sort();
+    return folders;
+  }
+
+  /// Hide [duration]'s worth of short tracks (or nothing at [Duration.zero]).
+  void setMinimumDuration(Duration duration) {
+    final next = duration < Duration.zero ? Duration.zero : duration;
+    if (next == _minimumDuration) return;
+    _minimumDuration = next;
+    _rebuildFromScan();
+    notifyListeners();
+    unawaited(_persistFilters());
+  }
+
+  /// Hide or restore every track in [folder].
+  void setFolderExcluded(String folder, {required bool excluded}) {
+    final changed = excluded
+        ? _excludedFolders.add(folder)
+        : _excludedFolders.remove(folder);
+    if (!changed) return;
+    _rebuildFromScan();
+    notifyListeners();
+    unawaited(_persistFilters());
+  }
+
+  /// Drop every exclusion, restoring the full scanned library.
+  void clearLibraryFilters() {
+    if (!hasLibraryFilters) return;
+    _excludedFolders.clear();
+    _minimumDuration = Duration.zero;
+    _rebuildFromScan();
+    notifyListeners();
+    unawaited(_persistFilters());
+  }
+
+  /// Load the saved exclusions, if any, and apply them to the scanned library.
+  Future<void> _loadFilterSettings() async {
+    final settings = await _filterStore.read();
+    if (settings == null || _disposed) return;
+
+    _excludedFolders
+      ..clear()
+      ..addAll(settings.excludedFolders);
+    _minimumDuration = settings.minimumDuration;
+
+    if (!hasLibraryFilters || _scannedSongs.isEmpty) return;
+    _rebuildFromScan();
+    notifyListeners();
+  }
+
+  Future<void> _persistFilters() => _filterStore.write(
+    LibraryFilterSettings(
+      excludedFolders: Set.of(_excludedFolders),
+      minimumDuration: _minimumDuration,
+    ),
+  );
+
+  /// Re-apply the exclusions to the scan and rebuild everything derived from it.
+  ///
+  /// Everything hangs off [_allSongs], so one pass here is what makes an
+  /// excluded track disappear from albums, artists, genre playlists, search,
+  /// favourites and playlists at once.
+  void _rebuildFromScan() {
+    _allSongs = _applyExclusions(_scannedSongs);
+    _invalidateSongDerivedCaches();
+    _albums = _mediaService.extractAlbums(_allSongs);
+    _artists = _mediaService.extractArtists(_allSongs);
+    _playlists = [
+      ..._mediaService.extractGenrePlaylists(_allSongs),
+      ..._userPlaylists,
+    ];
+    _applyFilter();
+  }
+
+  /// Drop the tracks the user has chosen to keep out.
+  List<WavelySong> _applyExclusions(List<WavelySong> songs) {
+    if (!hasLibraryFilters) return List.of(songs);
+    return [
+      for (final song in songs)
+        if (!_excludedFolders.contains(folderOfSong(song)) &&
+            song.duration >= _minimumDuration)
+          song,
+    ];
   }
 
   void toggleFavorite(String songId) {
@@ -373,7 +559,7 @@ class LibraryController extends ChangeNotifier {
   ///
   /// The filtered [songs] list is what the browse and search tabs render, but
   /// "All Songs" has to keep meaning all of them even while a search is active.
-  List<WavelySong> get allSongs => List.unmodifiable(_allSongs);
+  List<WavelySong> get allSongs => _allSongsView;
 
   /// Songs added to the device most recently.
   ///
@@ -399,13 +585,30 @@ class LibraryController extends ChangeNotifier {
   List<WavelySong> songsByArtist(String artistId) =>
       _allSongs.where((s) => s.artist == artistId).toList();
 
+  /// The list the cached runtime in [_runtimeTotal] belongs to.
+  List<WavelySong>? _runtimeFor;
+  Duration _runtimeTotal = Duration.zero;
+
   /// Total runtime of [songs], for the headers on the collection tabs.
-  Duration totalDurationOf(List<WavelySong> songs) => Duration(
-    milliseconds: songs.fold(
-      0,
-      (sum, song) => sum + song.duration.inMilliseconds,
-    ),
-  );
+  ///
+  /// A single-entry cache, because the same list is asked for its runtime by a
+  /// header that rebuilds every time the player announces anything: play, pause,
+  /// next, and the queue list itself. On a library of a few thousand tracks that
+  /// fold is the most expensive thing on the screen, and its answer cannot change
+  /// while the list it was computed from is the same object. Keyed on identity
+  /// rather than equality: any new list -- a rescan, a favourite toggle, a
+  /// search -- is a different object and recomputes.
+  Duration totalDurationOf(List<WavelySong> songs) {
+    if (identical(_runtimeFor, songs)) return _runtimeTotal;
+
+    var total = Duration.zero;
+    for (final song in songs) {
+      total += song.duration;
+    }
+    _runtimeFor = songs;
+    _runtimeTotal = total;
+    return total;
+  }
 
   /// Record that [songId] was played, most recent first.
   ///
@@ -438,4 +641,24 @@ class LibraryController extends ChangeNotifier {
     }
     return resolved;
   }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
+  }
+}
+
+/// The folder a song's file sits in, or null when the path is not known.
+///
+/// Derived from the file path rather than the media store's own folder field,
+/// which is not exposed by every query. A `content://` URI carries no real path,
+/// so those tracks cannot be attached to a folder and are never excluded by one.
+String? folderOfSong(WavelySong song) {
+  final path = song.uri;
+  if (path.isEmpty || path.contains('://')) return null;
+
+  final separator = path.lastIndexOf('/');
+  if (separator <= 0) return null;
+  return path.substring(0, separator);
 }

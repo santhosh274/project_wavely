@@ -47,6 +47,14 @@ abstract interface class AudioEngine {
   Future<void> stop();
   Future<void> seek(Duration position);
   Future<void> setVolume(double volume);
+
+  /// Set the playback rate. 1.0 is normal.
+  ///
+  /// Exposed for the listening room's drift correction, which nudges the rate by
+  /// a couple of percent to re-seat a guest that has slipped, in preference to
+  /// seeking and making the correction audible as a click.
+  Future<void> setSpeed(double speed);
+
   Future<void> setShuffle(bool enabled);
   Future<void> setRepeatMode(RepeatBehaviour mode);
   Future<void> skipToNext();

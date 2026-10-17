@@ -2,9 +2,36 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:wavely/core/models/song_model.dart';
 import 'package:wavely/core/services/audio_player_service.dart'
     show RepeatBehaviour;
 import 'package:wavely/core/services/playback_state_store.dart';
+
+const _songs = [
+  WavelySong(
+    id: '10',
+    title: 'Aurora Fields',
+    artist: 'Vela',
+    album: 'Harbour Lights',
+    duration: Duration(minutes: 3, seconds: 20),
+    uri: 'content://media/external/audio/media/10',
+    contentUri: 'content://media/external/audio/media/10',
+    albumId: 100,
+    genre: 'Ambient',
+    trackNumber: 2,
+    fileSize: 4242424,
+  ),
+  WavelySong(
+    id: '11',
+    title: 'Neon Tide',
+    artist: 'Vela',
+    album: 'Harbour Lights',
+    duration: Duration(minutes: 4, seconds: 5),
+    uri: 'content://media/external/audio/media/11',
+    albumId: 100,
+    isFavorite: true,
+  ),
+];
 
 PlaybackSnapshot _snapshot({
   List<String> songIds = const ['10', '11', '12'],
@@ -145,8 +172,103 @@ void main() {
       await store.clear();
 
       expect(await store.read(), isNull);
+      // The playhead goes with the queue it belonged to, or a cleared session
+      // would come back the moment anything was written again.
+      expect(
+        await File(
+          '${directory.path}/${FilePlaybackStateStore.progressFileName}',
+        ).exists(),
+        isFalse,
+      );
       // Clearing something that was never written is not an error.
       await store.clear();
+    });
+
+    test('the songs themselves come back, so no scan is needed', () async {
+      await store.write(
+        PlaybackSnapshot.of(
+          songs: _songs,
+          index: 1,
+          position: const Duration(seconds: 12),
+          wasPlaying: true,
+          shuffle: false,
+          repeatMode: RepeatBehaviour.off,
+          volume: 0.8,
+          queueTitle: 'Harbour Lights',
+          savedAt: DateTime.fromMillisecondsSinceEpoch(1767225600000),
+        ),
+      );
+
+      final restored = await store.read();
+      expect(restored, isNotNull);
+      expect(restored!.songIds, ['10', '11']);
+      expect(restored.songs, hasLength(2));
+      // Everything the player needs to open the file and the UI needs to draw
+      // it, including the album id artwork is keyed on.
+      expect(restored.songs.first.title, 'Aurora Fields');
+      expect(restored.songs.first.uri, 'content://media/external/audio/media/10');
+      expect(restored.songs.first.albumId, 100);
+      expect(restored.songs.first.fileSize, 4242424);
+      expect(restored.songs.last.isFavorite, isTrue);
+    });
+
+    test('moving the playhead does not rewrite the queue', () async {
+      final queueFile = File(
+        '${directory.path}/${FilePlaybackStateStore.fileName}',
+      );
+
+      await store.write(_snapshot());
+      final queueOnDisk = await queueFile.readAsString();
+
+      // Same queue, several seconds further in: this is the write that happens a
+      // few times a minute for the whole session, and rewriting every queued
+      // song each time is exactly what the second file exists to avoid.
+      await store.write(
+        _snapshot(position: const Duration(seconds: 99), index: 2),
+      );
+
+      expect(await queueFile.readAsString(), queueOnDisk);
+
+      // And the playhead still comes back, from the small file.
+      final restored = await store.read();
+      expect(restored!.position, const Duration(seconds: 99));
+      expect(restored.index, 2);
+    });
+
+    test('a queue that changed is rewritten', () async {
+      final queueFile = File(
+        '${directory.path}/${FilePlaybackStateStore.fileName}',
+      );
+
+      await store.write(_snapshot(songIds: const ['1'], index: 0));
+      await store.write(_snapshot(songIds: const ['2', '3'], index: 1));
+
+      expect(await queueFile.readAsString(), contains('"3"'));
+      expect((await store.read())!.songIds, ['2', '3']);
+    });
+
+    test('a playhead belonging to another queue is ignored', () async {
+      await store.write(_snapshot(index: 0));
+
+      // What a crash between the two writes would leave: a playhead recorded for
+      // a queue the state file does not describe. Applying it would drop the user
+      // into a track that is not there.
+      await File(
+        '${directory.path}/${FilePlaybackStateStore.progressFileName}',
+      ).writeAsString(
+        jsonEncode({
+          'token': 12345,
+          'index': 3,
+          'positionMs': 90000,
+          'wasPlaying': false,
+          'savedAtMs': 1,
+        }),
+      );
+
+      final restored = await store.read();
+      expect(restored!.index, 0);
+      expect(restored.position, const Duration(seconds: 42));
+      expect(restored.wasPlaying, isTrue);
     });
 
     test('a mangled file is treated as no stored session', () async {

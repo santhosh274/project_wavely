@@ -28,6 +28,14 @@
 	<true/>
 	<key>NSAppleMusicUsageDescription</key>
 	<string>Wavely needs access to your music library to show the songs, albums and artists stored on this device.</string>
+	<!-- Listening rooms. iOS 14 and up asks before an app may talk to another
+	     device on the same network; without this string the prompt cannot be
+	     shown and joining a room fails with no explanation. No Bonjour services
+	     are declared because the room has no discovery step to declare: the host
+	     shows a code, the guest types an address, and multicast -- which does
+	     need an entitlement -- is never used. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Wavely uses your local network to play one song in step with the phones in your listening room.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

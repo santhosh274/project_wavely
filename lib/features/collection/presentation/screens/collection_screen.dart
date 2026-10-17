@@ -10,6 +10,7 @@ import 'package:wavely/features/library/controllers/library_controller.dart';
 import 'package:wavely/features/library/presentation/screens/track_collection_screen.dart';
 import 'package:wavely/features/library/presentation/widgets/album_card.dart';
 import 'package:wavely/features/library/presentation/widgets/artist_tile.dart';
+import 'package:wavely/features/library/presentation/widgets/song_context_menu.dart';
 import 'package:wavely/features/library/presentation/widgets/song_tile.dart';
 import 'package:wavely/features/player/controllers/player_controller.dart';
 
@@ -236,9 +237,6 @@ class _AlbumsTab extends StatelessWidget {
       ),
       padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 12.0),
       itemCount: albums.length,
-      // Rows here hold no state worth keeping alive, and the grid builder's
-      // default keep-alive wrappers cost a widget each per card.
-      addAutomaticKeepAlives: false,
       itemBuilder: (context, index) {
         final album = albums[index];
         return AlbumCard(
@@ -279,7 +277,6 @@ class _ArtistsTab extends StatelessWidget {
     return ListView.builder(
       itemCount: artists.length,
       padding: const EdgeInsets.only(top: 8.0, bottom: 150.0),
-      addAutomaticKeepAlives: false,
       itemBuilder: (context, index) {
         final artist = artists[index];
         return ArtistTile(
@@ -389,52 +386,70 @@ class _SongListTab extends StatelessWidget {
 
     final runtime = libraryCtrl.totalDurationOf(songs);
 
-    return ListView.builder(
-      itemCount: songs.length + 1,
-      padding: const EdgeInsets.only(top: 12.0, bottom: 150.0),
-      addAutomaticKeepAlives: false,
-      itemBuilder: (context, index) {
-        if (index == 0) {
-          return _ListHeader(
-            title: title,
-            subtitle: subtitle,
-            count: songs.length,
-            runtime: runtime,
-            onPlayAll: () => playerCtrl.playTrack(
-              songs.first,
-              queueContext: songs,
-              queueTitle: title,
+    return CustomScrollView(
+      slivers: [
+        SliverPadding(
+          padding: const EdgeInsets.only(top: 12.0),
+          sliver: SliverToBoxAdapter(
+            child: _ListHeader(
+              title: title,
+              subtitle: subtitle,
+              count: songs.length,
+              runtime: runtime,
+              onPlayAll: () => playerCtrl.playTrack(
+                songs.first,
+                queueContext: songs,
+                queueTitle: title,
+              ),
+              onShuffleAll: songs.length < 2
+                  ? null
+                  : () async {
+                      final shuffled = List<WavelySong>.of(songs)..shuffle();
+                      if (shuffled.isEmpty) return;
+                      await playerCtrl.playTrack(
+                        shuffled.first,
+                        queueContext: shuffled,
+                        queueTitle: title,
+                      );
+                    },
             ),
-            onShuffleAll: songs.length < 2
-                ? null
-                : () async {
-                    final shuffled = List<WavelySong>.of(songs)..shuffle();
-                    if (shuffled.isEmpty) return;
-                    await playerCtrl.playTrack(
-                      shuffled.first,
-                      queueContext: shuffled,
-                      queueTitle: title,
-                    );
-                  },
-          );
-        }
-
-        final song = songs[index - 1];
-        return SongTile(
-          song: song,
-          isCurrent: playerCtrl.currentSong?.id == song.id,
-          isPlaying: playerCtrl.isPlaying,
-          onTap: () => playerCtrl.playTrack(
-            song,
-            queueContext: songs,
-            queueTitle: title,
           ),
-          onFavoriteToggle: () {
-            libraryCtrl.toggleFavorite(song.id);
-            playerCtrl.applyFavorite(song.id, isFavorite: !song.isFavorite);
-          },
-        );
-      },
+        ),
+        SliverPadding(
+          padding: const EdgeInsets.only(bottom: 150.0),
+          sliver: SliverFixedExtentList(
+            itemExtent: 68.0,
+            delegate: SliverChildBuilderDelegate(
+              (context, index) {
+                final song = songs[index];
+                return SongTile(
+                  key: ValueKey(song.id),
+                  song: song,
+                  isCurrent: playerCtrl.currentSong?.id == song.id,
+                  isPlaying: playerCtrl.isPlaying,
+                  onTap: () => playerCtrl.playTrack(
+                    song,
+                    queueContext: songs,
+                    queueTitle: title,
+                  ),
+                  onLongPress: () => showSongContextMenu(
+                    context,
+                    song: song,
+                    queueContext: songs,
+                    queueTitle: title,
+                  ),
+                  onFavoriteToggle: () {
+                    libraryCtrl.toggleFavorite(song.id);
+                    playerCtrl.applyFavorite(song.id, isFavorite: !song.isFavorite);
+                  },
+                );
+              },
+              childCount: songs.length,
+              addAutomaticKeepAlives: false,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
